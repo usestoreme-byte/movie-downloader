@@ -245,8 +245,11 @@ for idx, row in enumerate(all_rows):
 
     # Skip if already done or duplicate
     dl_status = str(row.get("DOWNLOAD_STATUS", "")).strip()
+    # ONLY process rows where DOWNLOAD_STATUS is blank — skip Done, Failed, and any other value
+    if dl_status.strip() != "":
+        continue
     dup_check = str(row.get("Duplicate_Check", "")).strip().upper()
-    if dl_status.lower() == "done" or dup_check == "DUPLICATE":
+    if dup_check == "DUPLICATE":
         continue
 
     download_link = str(row.get("Download_Link", "")).strip()
@@ -316,3 +319,6 @@ for idx, row in enumerate(all_rows):
 print(f"\n{'='*60}")
 print(f"COMPLETE — {processed} processed, {failed} failed")
 print(f"{'='*60}")
+
+
+
