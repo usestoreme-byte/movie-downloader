@@ -103,6 +103,8 @@ except Exception as auth_err:
 sheet = gc.open_by_key(SPREADSHEET_ID).get_worksheet(SHEET_INDEX)
 all_rows = sheet.get_all_records()
 headers = sheet.row_values(1)
+# Strip whitespace from headers (Google Sheets sometimes has leading/trailing spaces)
+headers = [h.strip() if isinstance(h, str) else h for h in headers]
 
 # Column indices (1-based for gspread)
 try:
@@ -116,7 +118,7 @@ try:
     dup_col = headers.index("Duplicate_Check") + 1     # J
     error_col = headers.index("Error") + 1             # K
 except ValueError as e:
-    raise Exception(f"Missing column header: {e}")
+    raise Exception(f"Missing column header: {e}. Found headers: {headers}")
 
 # ============================================================================
 # HELPERS
@@ -137,9 +139,12 @@ def parse_media_languages(file_path):
         return ["English"]
 
 def build_filename(tmdb_name, year, quality, languages):
-    """Build clean filename: Title (Year) Quality Lang1 + Lang2.mkv"""
+    """Build clean filename: Title (Year) Quality Lang1 + Lang2 (no extension — Vidara works without it)"""
     short_langs = [l[:3] for l in languages]
-    name = f"{tmdb_name} ({year}) {quality} {' + '.join(short_langs)}.mkv" if year else f"{tmdb_name} {quality} {' + '.join(short_langs)}.mkv"
+    if year:
+        name = f"{tmdb_name} ({year}) {quality} {' + '.join(short_langs)}"
+    else:
+        name = f"{tmdb_name} {quality} {' + '.join(short_langs)}"
     return name
 
 def fetch_vidara_upload_server():
