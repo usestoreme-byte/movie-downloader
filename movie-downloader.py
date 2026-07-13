@@ -295,7 +295,6 @@ for idx, row in enumerate(all_rows):
         sheet.update_cell(row_idx, final_link_col, vidara_url)
         sheet.update_cell(row_idx, status_col, "Done")
         sheet.update_cell(row_idx, error_col, "")
-        SpreadsheetApp_flush()  # placeholder — gspread auto-flushes
 
         processed += 1
 
