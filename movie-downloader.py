@@ -266,9 +266,8 @@ for idx, row in enumerate(all_rows):
     print(f"{'='*60}")
 
     try:
-        # 1. Download
-        original_name = os.path.basename(download_link.split('?')[0]) or f"movie_{row_idx}.mkv"
-        temp_path = os.path.join(TEMP_FOLDER, original_name)
+        # 1. Download — filename doesn't matter, we rename it after detecting languages
+        temp_path = os.path.join(TEMP_FOLDER, f"movie_{row_idx}.mkv")
         print(f"   Downloading from: {download_link[:80]}...")
 
         if not download_file(download_link, temp_path):
@@ -319,6 +318,3 @@ for idx, row in enumerate(all_rows):
 print(f"\n{'='*60}")
 print(f"COMPLETE — {processed} processed, {failed} failed")
 print(f"{'='*60}")
-
-
-
