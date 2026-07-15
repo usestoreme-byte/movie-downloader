@@ -140,11 +140,14 @@ def parse_media_languages(file_path):
 
 def build_filename(tmdb_name, year, quality, languages):
     """Build clean filename: Title (Year) Quality Lang1 + Lang2 (no extension — Vidara works without it)"""
+    # Fix: Remove periods from the movie name to prevent Vidara from truncating the name at the first dot
+    clean_title = tmdb_name.replace(".", "").strip()
+    
     short_langs = [l[:3] for l in languages]
     if year:
-        name = f"{tmdb_name} ({year}) {quality} {' + '.join(short_langs)}"
+        name = f"{clean_title} ({year}) {quality} {' + '.join(short_langs)}"
     else:
-        name = f"{tmdb_name} {quality} {' + '.join(short_langs)}"
+        name = f"{clean_title} {quality} {' + '.join(short_langs)}"
     return name
 
 def fetch_vidara_upload_server():
@@ -161,7 +164,7 @@ def fetch_vidara_upload_server():
 def upload_to_vidara(file_path, custom_name):
     """Upload file to Vidara, return filecode/URL."""
     upload_server = fetch_vidara_upload_server()
-    print(f"   Uploading to Vidara: {custom_name} ({round(os.path.getsize(file_path) / 1048576, 1)} MB)")
+    print(f"    Uploading to Vidara: {custom_name} ({round(os.path.getsize(file_path) / 1048576, 1)} MB)")
 
     encoder = MultipartEncoder(fields={
         "api_key": VIDARA_API_KEY,
@@ -213,7 +216,7 @@ def download_file(url, dest_path):
         return True
 
     # Fallback: requests streaming
-    print("   [WARN] aria2c failed, trying direct stream...")
+    print("    [WARN] aria2c failed, trying direct stream...")
     try:
         if os.path.exists(dest_path):
             os.remove(dest_path)
@@ -226,7 +229,7 @@ def download_file(url, dest_path):
                         f.write(chunk)
         return os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024 * 1024
     except Exception as e:
-        print(f"   [ERROR] Direct stream failed: {e}")
+        print(f"    [ERROR] Direct stream failed: {e}")
         return False
 
 # ============================================================================
@@ -268,30 +271,30 @@ for idx, row in enumerate(all_rows):
     try:
         # 1. Download — filename doesn't matter, we rename it after detecting languages
         temp_path = os.path.join(TEMP_FOLDER, f"movie_{row_idx}.mkv")
-        print(f"   Downloading from: {download_link[:80]}...")
+        print(f"    Downloading from: {download_link[:80]}...")
 
         if not download_file(download_link, temp_path):
             raise Exception("Download failed (both aria2c and streaming)")
 
         # 2. Detect audio languages
         languages = parse_media_languages(temp_path)
-        print(f"   Detected languages: {languages}")
+        print(f"    Detected languages: {languages}")
 
         # 3. Rename
         clean_name = build_filename(tmdb_name, year, quality, languages)
         final_path = os.path.join(OUTPUT_FOLDER, clean_name)
         shutil.move(temp_path, final_path)
-        print(f"   Renamed to: {clean_name}")
+        print(f"    Renamed to: {clean_name}")
 
         # 4. Upload to Vidara
         vidara_url = upload_to_vidara(final_path, clean_name)
         if not vidara_url:
             raise Exception("Vidara upload returned no URL")
-        print(f"   Vidara URL: {vidara_url}")
+        print(f"    Vidara URL: {vidara_url}")
 
         # 5. Call BEAM worker upsert
         result = beam_upsert(jwt, tmdb_id, quality, languages, vidara_url)
-        print(f"   DB: {result.get('action', 'unknown')} (link_id: {result.get('id')})")
+        print(f"    DB: {result.get('action', 'unknown')} (link_id: {result.get('id')})")
 
         # 6. Write back to sheet
         sheet.update_cell(row_idx, final_link_col, vidara_url)
@@ -305,7 +308,7 @@ for idx, row in enumerate(all_rows):
             os.remove(final_path)
 
     except Exception as e:
-        print(f"   [ERROR] {e}")
+        print(f"    [ERROR] {e}")
         sheet.update_cell(row_idx, status_col, "Failed")
         sheet.update_cell(row_idx, error_col, str(e)[:500])
         failed += 1
