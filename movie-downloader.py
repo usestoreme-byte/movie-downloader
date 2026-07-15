@@ -82,7 +82,7 @@ LANG_MAP = {
 }
 
 # ============================================================================
-# GOOGLE SHEETS AUTH
+# GOOGLE SHEETS AUTH & DATA EXTRACTION
 # ============================================================================
 print("=" * 60)
 print("BEAM MOVIE DOWNLOADER — STARTING")
@@ -101,12 +101,16 @@ except Exception as auth_err:
     raise
 
 sheet = gc.open_by_key(SPREADSHEET_ID).get_worksheet(SHEET_INDEX)
-all_rows = sheet.get_all_records()
-headers = sheet.row_values(1)
-# Strip whitespace from headers (Google Sheets sometimes has leading/trailing spaces)
-headers = [h.strip() if isinstance(h, str) else h for h in headers]
 
-# Column indices (1-based for gspread)
+# Get all values from the sheet to manually parse rows (ignores extra blank columns)
+raw_values = sheet.get_all_values()
+if not raw_values:
+    raise Exception("The worksheet is completely empty!")
+
+# Extract headers (first row) and strip whitespaces
+headers = [h.strip() if isinstance(h, str) else h for h in raw_values[0]]
+
+# Column indices (1-based for gspread updates, 0-based for list indices)
 try:
     tmdb_id_col = headers.index("TMDB_ID") + 1         # C
     tmdb_name_col = headers.index("TMDB_NAME") + 1     # D
@@ -119,6 +123,14 @@ try:
     error_col = headers.index("Error") + 1             # K
 except ValueError as e:
     raise Exception(f"Missing column header: {e}. Found headers: {headers}")
+
+# Convert row lists into dictionary records manually to avoid empty column issues
+all_rows = []
+for row_cells in raw_values[1:]:
+    # Pad rows with empty strings if they are shorter than the headers length
+    padded_row = row_cells + [""] * (len(headers) - len(row_cells))
+    row_dict = {headers[i]: padded_row[i] for i in range(len(headers)) if headers[i] != ""}
+    all_rows.append(row_dict)
 
 # ============================================================================
 # HELPERS
@@ -321,3 +333,10 @@ for idx, row in enumerate(all_rows):
 print(f"\n{'='*60}")
 print(f"COMPLETE — {processed} processed, {failed} failed")
 print(f"{'='*60}")
+
+# Cleanup
+try:
+    shutil.rmtree(OUTPUT_FOLDER)
+    shutil.rmtree(TEMP_FOLDER)
+except:
+    pass
