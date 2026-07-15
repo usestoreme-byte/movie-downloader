@@ -152,8 +152,17 @@ def parse_media_languages(file_path):
 
 def build_filename(tmdb_name, year, quality, languages):
     """Build clean filename: Title (Year) Quality Lang1 + Lang2 (no extension — Vidara works without it)"""
-    # Fix: Remove periods from the movie name to prevent Vidara from truncating the name at the first dot
+    # Fix 1: Remove dots to prevent Vidara filename truncation
     clean_title = tmdb_name.replace(".", "").strip()
+    
+    # Fix 2: Replace forward slashes with hyphens so Linux doesn't treat it as a subfolder directory path
+    clean_title = clean_title.replace("/", "-")
+    
+    # Fix 3: Strip out all other illegal filesystem characters (: * ? " < > |)
+    clean_title = re.sub(r'[:*?"<>|]', "", clean_title)
+    
+    # Collapse any accidental double spaces created by deletions
+    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
     
     short_langs = [l[:3] for l in languages]
     if year:
