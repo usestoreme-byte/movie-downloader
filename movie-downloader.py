@@ -62,15 +62,38 @@ LANG_MAP = {
 # ============================================================================
 
 def parse_media_languages(file_path):
+    """
+    Parses Audio tracks normally. If subtitle tracks (Text) exist and are 'unknown', 
+    forces English context rules.
+    """
     try:
         media = MediaInfo.parse(str(file_path))
-        langs = []
+        audio_langs = []
+        has_subtitles = False
+        unknown_subtitles = False
+
         for track in media.tracks:
             if track.track_type == "Audio":
                 code = track.language if track.language else "en"
                 mapped = LANG_MAP.get(code.lower(), "English")
-                langs.append(mapped)
-        return list(dict.fromkeys(langs)) or ["English"]
+                audio_langs.append(mapped)
+            elif track.track_type == "Text":
+                has_subtitles = True
+                code = track.language
+                if not code or code.lower() in ["unknown", "und", ""]:
+                    unknown_subtitles = True
+
+        # Process standard clean deduplicated audio strings
+        unique_audio = list(dict.fromkeys(audio_langs))
+        if not unique_audio:
+            unique_audio = ["English"]
+
+        # If a subtitle track was explicitly matched as unknown, map or inject English fallback
+        if has_subtitles and unknown_subtitles:
+            if "English" not in unique_audio:
+                unique_audio.append("English")
+
+        return unique_audio
     except Exception:
         return ["English"]
 
@@ -86,6 +109,8 @@ def clean_string_for_vidara(text):
 def build_filename(tmdb_name, year, quality, languages):
     clean_title = clean_string_for_vidara(tmdb_name)
     short_langs = [l[:3] for l in languages]
+    
+    # Strictly formats to: Movie Name (Year) Quality Languages.mkv
     if year:
         name = f"{clean_title} ({year}) {quality} {' + '.join(short_langs)}.mkv"
     else:
@@ -202,7 +227,6 @@ if not raw_values:
 
 headers = [h.strip() for h in raw_values[0]]
 
-# Map indices dynamically based on actual header values
 try:
     filename_col = headers.index("Filename") + 1
     status_col = headers.index("Status") + 1
@@ -238,7 +262,6 @@ except Exception as login_err:
     print(f"[CRITICAL] BEAM Engine authentication failed: {login_err}")
     raise
 
-# Iterate backwards to maintain correct structural deletions safely
 for idx in range(len(all_rows) - 1, -1, -1):
     row = all_rows[idx]
     row_idx = idx + 2
@@ -296,6 +319,7 @@ for idx in range(len(all_rows) - 1, -1, -1):
             if not download_file(download_link, temp_path):
                 raise Exception("Download stage execution failed.")
 
+            # Independent variant analysis ensures only the specific video track assets are read
             languages = parse_media_languages(temp_path)
             print(f"    Detected languages: {languages}")
 
@@ -329,17 +353,14 @@ for idx in range(len(all_rows) - 1, -1, -1):
                 try: os.remove(temp_path)
                 except: pass
 
-    # Error handling reflection logic
     if errors:
         queue_sheet.update_cell(row_idx, error_col, " | ".join(errors)[:500])
     else:
         queue_sheet.update_cell(row_idx, error_col, "")
 
-    # Calculate overall completeness metrics
     total_links_count = sum(1 for link in links.values() if link)
     done_links_count = sum(1 for q, link in links.items() if link and statuses[q] == "done")
 
-    # Scenario A: All valid inputs are verified as "Done"
     if total_links_count > 0 and done_links_count == total_links_count:
         print(f"\nRow {row_idx} fully completed ({done_links_count}/{total_links_count}). Archiving entry...")
         
@@ -363,7 +384,6 @@ for idx in range(len(all_rows) - 1, -1, -1):
         queue_sheet.delete_rows(row_idx)
         print(f"[OK] Row {row_idx} fully processed and dropped from active operational Queue.")
 
-    # Scenario B: Partial updates completed
     elif len(newly_finished) > 0:
         print(f"\nRow {row_idx} has logged partial success. Writing completed variants to Archive...")
         
@@ -386,7 +406,6 @@ for idx in range(len(all_rows) - 1, -1, -1):
         archive_sheet.append_row(archive_row, value_input_option="USER_ENTERED")
         print(f"[OK] Logged updates successfully for variants: {newly_finished}.")
 
-# Global cleanups
 try:
     shutil.rmtree(OUTPUT_FOLDER)
     shutil.rmtree(TEMP_FOLDER)
