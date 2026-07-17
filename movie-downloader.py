@@ -84,7 +84,6 @@ try:
     archive_sheet = spreadsheet.worksheet("Archive")
     print("[OK] Loaded worksheets: Queue & Archive")
 except Exception:
-    # Fallback if worksheet names do not match
     queue_sheet = spreadsheet.get_worksheet(0)
     archive_sheet = spreadsheet.get_worksheet(1)
     print(f"[WARN] Tab named 'Queue' or 'Archive' not found. Falling back to sheets at indices 0 and 1.")
@@ -96,7 +95,7 @@ if not raw_values:
 
 headers = [h.strip() if isinstance(h, str) else h for h in raw_values[0]]
 
-# Map indices dynamically to prevent shifting breaks (1-based for updates, 0-based for list indexing)
+# Map indices dynamically (1-based for updates)
 try:
     tmdb_id_col = headers.index("TMDB_ID") + 1                    # C
     tmdb_name_col = headers.index("TMDB_NAME") + 1                # D
@@ -123,7 +122,7 @@ for row_cells in raw_values[1:]:
     all_rows.append(row_dict)
 
 # ============================================================================
-# HELPERS (ORIGINAL IMPLEMENTATIONS PRESERVED)
+# HELPERS
 # ============================================================================
 
 def parse_media_languages(file_path):
@@ -139,11 +138,17 @@ def parse_media_languages(file_path):
     except Exception:
         return ["English"]
 
+def clean_string_for_vidara(text):
+    if not text:
+        return ""
+    text = text.replace(".", "")
+    text = text.replace("/", "-")
+    text = re.sub(r'[:*?"<>|]', "", text)
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
 def build_filename(tmdb_name, year, quality, languages):
-    clean_title = tmdb_name.replace(".", "").strip()
-    clean_title = clean_title.replace("/", "-")
-    clean_title = re.sub(r'[:*?"<>|]', "", clean_title)
-    clean_title = re.sub(r'\s+', ' ', clean_title).strip()
+    clean_title = clean_string_for_vidara(tmdb_name)
     short_langs = [l[:3] for l in languages]
     if year:
         name = f"{clean_title} ({year}) {quality} {' + '.join(short_langs)}"
@@ -175,8 +180,7 @@ def upload_to_vidara(file_path, custom_name):
 
     if response.status_code == 200:
         data = response.json()
-        final_url = data.get("filecode") or data.get("url") or data.get("result", {}).get("url")
-        return final_url
+        return data.get("filecode") or data.get("url") or data.get("result", {}).get("url")
     else:
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
 
@@ -234,12 +238,10 @@ print(f"\nProcessing {len(all_rows)} rows...")
 jwt = beam_login()
 print("[OK] Logged into BEAM worker\n")
 
-# Process in reverse (from bottom up) so row deletions don't break row indices
 for idx in range(len(all_rows) - 1, -1, -1):
     row = all_rows[idx]
-    row_idx = idx + 2  # sheet rows are 1-indexed, +1 for header
+    row_idx = idx + 2
 
-    # Get identification details
     tmdb_id = str(row.get("TMDB_ID", "")).strip()
     tmdb_name = str(row.get("TMDB_NAME", "")).strip()
     year = str(row.get("YEAR", "")).strip()
@@ -247,34 +249,29 @@ for idx in range(len(all_rows) - 1, -1, -1):
     if not tmdb_id:
         continue
 
-    # Skip duplicates completely
     dup_check = str(row.get("Duplicate_Check", "")).strip().upper()
     if dup_check == "DUPLICATE":
         print(f"Skipping Row {row_idx}: Marked as DUPLICATE.")
         continue
 
-    # Fetch links
     links = {
         "1080p": str(row.get("Link_1080p", "")).strip(),
         "720p": str(row.get("Link_720p", "")).strip(),
         "480p": str(row.get("Link_480p", "")).strip()
     }
 
-    # Fetch existing statuses
     statuses = {
         "1080p": str(row.get("DOWNLOAD_STATUS_1080p", "")).strip().lower(),
         "720p": str(row.get("DOWNLOAD_STATUS_720p", "")).strip().lower(),
         "480p": str(row.get("DOWNLOAD_STATUS_480p", "")).strip().lower()
     }
 
-    # Identify variants that actually need processing
     active_variants = {}
     for q, link in links.items():
         if link and statuses[q] != "done":
             active_variants[q] = link
 
     if not active_variants:
-        # If everything present in the row has already finished, skip
         continue
 
     print(f"\n{'='*60}")
@@ -282,15 +279,12 @@ for idx in range(len(all_rows) - 1, -1, -1):
     print(f"{'='*60}")
 
     errors = []
-
-    # Map target columns to write to
     status_col_map = {
         "1080p": status_1080_col,
         "720p": status_720_col,
         "480p": status_480_col
     }
 
-    # Track what has finished in *this run* versus what was already done
     newly_finished = []
 
     for quality, download_link in active_variants.items():
@@ -298,36 +292,29 @@ for idx in range(len(all_rows) - 1, -1, -1):
         temp_path = os.path.join(TEMP_FOLDER, f"movie_{row_idx}_{quality}.mkv")
 
         try:
-            # 1. Download
             if not download_file(download_link, temp_path):
-                raise Exception("Download failed (both aria2c and streaming)")
+                raise Exception("Download failed")
 
-            # 2. Extract media languages
             languages = parse_media_languages(temp_path)
             print(f"    Detected languages: {languages}")
 
-            # 3. Build filename & rename
             clean_name = build_filename(tmdb_name, year, quality, languages)
             final_path = os.path.join(OUTPUT_FOLDER, clean_name)
             shutil.move(temp_path, final_path)
             print(f"    Renamed to: {clean_name}")
 
-            # 4. Upload
             vidara_url = upload_to_vidara(final_path, clean_name)
             if not vidara_url:
                 raise Exception("Vidara upload returned no URL")
             print(f"    Vidara URL: {vidara_url}")
 
-            # 5. DB Upsert
             result = beam_upsert(jwt, tmdb_id, quality, languages, vidara_url)
             print(f"    DB Upsert status: {result.get('action', 'unknown')} (link_id: {result.get('id')})")
 
-            # 6. Update individual quality status on active workspace
             queue_sheet.update_cell(row_idx, status_col_map[quality], "Done")
             statuses[quality] = "done"
             newly_finished.append(quality)
 
-            # Clean local files
             if os.path.exists(final_path):
                 os.remove(final_path)
 
@@ -341,20 +328,19 @@ for idx in range(len(all_rows) - 1, -1, -1):
                 try: os.remove(temp_path)
                 except: pass
 
-    # Write errors back (if any)
     if errors:
         queue_sheet.update_cell(row_idx, error_col, " | ".join(errors)[:500])
     else:
         queue_sheet.update_cell(row_idx, error_col, "")
 
-    # ARCHIVE / SPLIT LOGIC:
-    # 1. Check if we have active links, and whether all of them are "done"
+    # ARCHIVE LOGIC FIX:
+    # Explicitly calculate column alignment structure arrays to prevent horizontal cell offsets
     total_links_count = sum(1 for link in links.values() if link)
     done_links_count = sum(1 for q, link in links.items() if link and statuses[q] == "done")
 
     # Scenario A: All present links are fully done!
     if total_links_count > 0 and done_links_count == total_links_count:
-        print(f"\nRow {row_idx} fully completed ({done_links_count}/{total_links_count}). Moving to Archive and deleting from Queue...")
+        print(f"\nRow {row_idx} fully completed ({done_links_count}/{total_links_count}). Archiving...")
         
         archive_row = [
             row.get("Filename", ""),
@@ -368,21 +354,19 @@ for idx in range(len(all_rows) - 1, -1, -1):
             "Done" if links["1080p"] else "",
             "Done" if links["720p"] else "",
             "Done" if links["480p"] else "",
-            "", # Clear duplicate check
-            ""  # Clear errors
+            "", 
+            ""  
         ]
         
-        archive_sheet.append_row(archive_row)
+        # Explicit structure value input option preserves exact multi-column dimensions starting from Column A
+        archive_sheet.append_row(archive_row, value_input_option="USER_ENTERED")
         queue_sheet.delete_rows(row_idx)
         print(f"[OK] Row {row_idx} archived and removed from active Queue.")
 
     # Scenario B: Partial completion.
-    # Some finished, but at least one link is still pending/failed.
     elif len(newly_finished) > 0:
-        print(f"\nRow {row_idx} has partial progress. Moving ONLY the completed qualities {newly_finished} to Archive. Keeping row in Queue...")
+        print(f"\nRow {row_idx} has partial progress. Archiving completed metrics...")
         
-        # We append only the completed qualities to the Archive.
-        # The pending/failed qualities will be blank in the archive entry.
         archive_row = [
             row.get("Filename", ""),
             row.get("Status", ""),
@@ -399,8 +383,8 @@ for idx in range(len(all_rows) - 1, -1, -1):
             ""
         ]
         
-        archive_sheet.append_row(archive_row)
-        print(f"[OK] Partially completed variants archived. Row left in active Queue for remaining work.")
+        archive_sheet.append_row(archive_row, value_input_option="USER_ENTERED")
+        print(f"[OK] Partially completed variants archived cleanly from A-M.")
 
 # Global cleanup of folders
 try:
@@ -409,6 +393,4 @@ try:
 except:
     pass
 
-print(f"\n{'='*60}")
-print("PIPELINE SEQUENCE COMPLETE")
-print(f"{'='*60}")
+print(f"\n{'='*60}\nPIPELINE SEQUENCE COMPLETE\n{'='*60}")
