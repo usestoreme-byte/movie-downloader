@@ -1,30 +1,10 @@
 #!/usr/bin/env python3
 """
-BEAM Movie Downloader — GitHub Actions Pipeline
-================================================
-Reads Google Sheet rows → downloads movie → detects audio languages via MediaInfo →
-renames file → uploads to Vidara → calls BEAM Worker upsert API → writes URL back to sheet.
-
-Sheet columns (Movies tab):
-  A: Filename
-  B: Status           (DONE, NOT_FOUND)
-  C: TMDB_ID
-  D: TMDB_NAME
-  E: YEAR
-  F: Quality          (1080p, 720p, 480p, 2160p, 360p)
-  G: Download_Link
-  H: DOWNLOAD_STATUS  (blank=pending, Done, Failed)
-  I: FINAL_LINK       (Vidara URL)
-  J: Duplicate_Check  (DUPLICATE or blank)
-  K: Error
-
-Setup:
-  GitHub Secrets needed:
-    GOOGLE_SHEETS_JSON  — service account JSON (string)
-    SPREADSHEET_ID      — Google Sheet ID
-    VIDARA_API_KEY      — Vidara API key
-    BEAM_ADMIN_EMAIL    — beam-worker admin email
-    BEAM_ADMIN_PASSWORD — beam-worker admin password
+BEAM Movie Downloader — GitHub Actions Pipeline (Single-Row Multi-Quality Workflow)
+==================================================================================
+Reads Queue sheet rows → downloads movie variants → detects languages via MediaInfo →
+renames file → uploads to Vidara → calls BEAM Worker upsert API → updates quality statuses →
+archives completed movies.
 """
 
 import os
@@ -65,14 +45,11 @@ ADMIN_PASSWORD = os.environ.get("BEAM_ADMIN_PASSWORD", "Chandu2030")
 # Folders
 OUTPUT_FOLDER = "./media/movies"
 TEMP_FOLDER = "./temp_downloads"
-SHEET_INDEX = 0  # First tab
-
-MAX_CONCURRENT = 3  # sequential for now, can be threaded later
 
 for p in [OUTPUT_FOLDER, TEMP_FOLDER]:
     os.makedirs(p, exist_ok=True)
 
-# Language mapping (MediaInfo codes → display names)
+# Language mapping
 LANG_MAP = {
     "as": "Assamese", "te": "Telugu", "hi": "Hindi", "ta": "Tamil", "ml": "Malayalam",
     "kn": "Kannada", "bn": "Bengali", "pa": "Punjabi", "gu": "Gujarati", "mr": "Marathi",
@@ -85,7 +62,7 @@ LANG_MAP = {
 # GOOGLE SHEETS AUTH & DATA EXTRACTION
 # ============================================================================
 print("=" * 60)
-print("BEAM MOVIE DOWNLOADER — STARTING")
+print("BEAM MOVIE DOWNLOADER — STARTING MULTI-QUALITY QUEUE RUN")
 print("=" * 60)
 
 try:
@@ -100,44 +77,56 @@ except Exception as auth_err:
     print(f"[CRITICAL] Auth failed: {auth_err}")
     raise
 
-sheet = gc.open_by_key(SPREADSHEET_ID).get_worksheet(SHEET_INDEX)
+# Explicitly open workbooks
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+try:
+    queue_sheet = spreadsheet.worksheet("Queue")
+    archive_sheet = spreadsheet.worksheet("Archive")
+    print("[OK] Loaded worksheets: Queue & Archive")
+except Exception:
+    # Fallback if worksheet names do not match
+    queue_sheet = spreadsheet.get_worksheet(0)
+    archive_sheet = spreadsheet.get_worksheet(1)
+    print(f"[WARN] Tab named 'Queue' or 'Archive' not found. Falling back to sheets at indices 0 and 1.")
 
-# Get all values from the sheet to manually parse rows (ignores extra blank columns)
-raw_values = sheet.get_all_values()
+# Get all values from active Queue
+raw_values = queue_sheet.get_all_values()
 if not raw_values:
-    raise Exception("The worksheet is completely empty!")
+    raise Exception("The Queue worksheet is completely empty!")
 
-# Extract headers (first row) and strip whitespaces
 headers = [h.strip() if isinstance(h, str) else h for h in raw_values[0]]
 
-# Column indices (1-based for gspread updates, 0-based for list indices)
+# Map indices dynamically to prevent shifting breaks (1-based for updates, 0-based for list indexing)
 try:
-    tmdb_id_col = headers.index("TMDB_ID") + 1         # C
-    tmdb_name_col = headers.index("TMDB_NAME") + 1     # D
-    year_col = headers.index("YEAR") + 1               # E
-    quality_col = headers.index("Quality") + 1         # F
-    dl_link_col = headers.index("Download_Link") + 1   # G
-    status_col = headers.index("DOWNLOAD_STATUS") + 1  # H
-    final_link_col = headers.index("FINAL_LINK") + 1   # I
-    dup_col = headers.index("Duplicate_Check") + 1     # J
-    error_col = headers.index("Error") + 1             # K
+    tmdb_id_col = headers.index("TMDB_ID") + 1                    # C
+    tmdb_name_col = headers.index("TMDB_NAME") + 1                # D
+    year_col = headers.index("YEAR") + 1                          # E
+    
+    link_1080_col = headers.index("Link_1080p") + 1               # F
+    link_720_col = headers.index("Link_720p") + 1                 # G
+    link_480_col = headers.index("Link_480p") + 1                 # H
+    
+    status_1080_col = headers.index("DOWNLOAD_STATUS_1080p") + 1  # I
+    status_720_col = headers.index("DOWNLOAD_STATUS_720p") + 1    # J
+    status_480_col = headers.index("DOWNLOAD_STATUS_480p") + 1    # K
+    
+    dup_col = headers.index("Duplicate_Check") + 1                # L
+    error_col = headers.index("Error") + 1                        # M
 except ValueError as e:
-    raise Exception(f"Missing column header: {e}. Found headers: {headers}")
+    raise Exception(f"Missing column header in layout: {e}. Current headers: {headers}")
 
-# Convert row lists into dictionary records manually to avoid empty column issues
+# Structure data rows
 all_rows = []
 for row_cells in raw_values[1:]:
-    # Pad rows with empty strings if they are shorter than the headers length
     padded_row = row_cells + [""] * (len(headers) - len(row_cells))
     row_dict = {headers[i]: padded_row[i] for i in range(len(headers)) if headers[i] != ""}
     all_rows.append(row_dict)
 
 # ============================================================================
-# HELPERS
+# HELPERS (ORIGINAL IMPLEMENTATIONS PRESERVED)
 # ============================================================================
 
 def parse_media_languages(file_path):
-    """Detect audio languages from file using MediaInfo."""
     try:
         media = MediaInfo.parse(str(file_path))
         langs = []
@@ -151,19 +140,10 @@ def parse_media_languages(file_path):
         return ["English"]
 
 def build_filename(tmdb_name, year, quality, languages):
-    """Build clean filename: Title (Year) Quality Lang1 + Lang2 (no extension — Vidara works without it)"""
-    # Fix 1: Remove dots to prevent Vidara filename truncation
     clean_title = tmdb_name.replace(".", "").strip()
-    
-    # Fix 2: Replace forward slashes with hyphens so Linux doesn't treat it as a subfolder directory path
     clean_title = clean_title.replace("/", "-")
-    
-    # Fix 3: Strip out all other illegal filesystem characters (: * ? " < > |)
     clean_title = re.sub(r'[:*?"<>|]', "", clean_title)
-    
-    # Collapse any accidental double spaces created by deletions
     clean_title = re.sub(r'\s+', ' ', clean_title).strip()
-    
     short_langs = [l[:3] for l in languages]
     if year:
         name = f"{clean_title} ({year}) {quality} {' + '.join(short_langs)}"
@@ -172,7 +152,6 @@ def build_filename(tmdb_name, year, quality, languages):
     return name
 
 def fetch_vidara_upload_server():
-    """Get active Vidara upload server."""
     try:
         res = requests.get("https://api.vidara.so/v1/upload/server", params={"api_key": VIDARA_API_KEY}, timeout=30)
         res.raise_for_status()
@@ -183,7 +162,6 @@ def fetch_vidara_upload_server():
         return "https://api.vidara.so/v1/upload/server"
 
 def upload_to_vidara(file_path, custom_name):
-    """Upload file to Vidara, return filecode/URL."""
     upload_server = fetch_vidara_upload_server()
     print(f"    Uploading to Vidara: {custom_name} ({round(os.path.getsize(file_path) / 1048576, 1)} MB)")
 
@@ -203,7 +181,6 @@ def upload_to_vidara(file_path, custom_name):
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
 
 def beam_login():
-    """Login to BEAM worker, return JWT token."""
     res = requests.post(f"{BEAM_WORKER_URL}/auth/login", json={
         "email": ADMIN_EMAIL,
         "password": ADMIN_PASSWORD
@@ -212,7 +189,6 @@ def beam_login():
     return res.json()["token"]
 
 def beam_upsert(jwt, tmdb_id, quality, languages, url):
-    """Call BEAM worker upsert endpoint."""
     res = requests.post(f"{BEAM_WORKER_URL}/admin/vidara/upsert", json={
         "content_type": "movie",
         "tmdb_id": int(tmdb_id),
@@ -224,8 +200,6 @@ def beam_upsert(jwt, tmdb_id, quality, languages, url):
     return res.json()
 
 def download_file(url, dest_path):
-    """Download file using aria2c, fall back to requests streaming."""
-    # Try aria2c first
     cmd = [
         "aria2c", "-x", "8", "-s", "8", "-k", "5M",
         "--file-allocation=none", "--summary-interval=0", "--retry-wait=10",
@@ -236,7 +210,6 @@ def download_file(url, dest_path):
     if result.returncode == 0 and os.path.exists(dest_path) and os.path.getsize(dest_path) > 1024 * 1024:
         return True
 
-    # Fallback: requests streaming
     print("    [WARN] aria2c failed, trying direct stream...")
     try:
         if os.path.exists(dest_path):
@@ -254,98 +227,162 @@ def download_file(url, dest_path):
         return False
 
 # ============================================================================
-# MAIN PIPELINE
+# MAIN MULTI-QUALITY PIPELINE
 # ============================================================================
 print(f"\nProcessing {len(all_rows)} rows...")
 
 jwt = beam_login()
 print("[OK] Logged into BEAM worker\n")
 
-processed = 0
-failed = 0
-
-for idx, row in enumerate(all_rows):
+# Process in reverse (from bottom up) so row deletions don't break row indices
+for idx in range(len(all_rows) - 1, -1, -1):
+    row = all_rows[idx]
     row_idx = idx + 2  # sheet rows are 1-indexed, +1 for header
 
-    # Skip if already done or duplicate
-    dl_status = str(row.get("DOWNLOAD_STATUS", "")).strip()
-    # ONLY process rows where DOWNLOAD_STATUS is blank — skip Done, Failed, and any other value
-    if dl_status.strip() != "":
-        continue
-    dup_check = str(row.get("Duplicate_Check", "")).strip().upper()
-    if dup_check == "DUPLICATE":
-        continue
-
-    download_link = str(row.get("Download_Link", "")).strip()
+    # Get identification details
     tmdb_id = str(row.get("TMDB_ID", "")).strip()
     tmdb_name = str(row.get("TMDB_NAME", "")).strip()
     year = str(row.get("YEAR", "")).strip()
-    quality = str(row.get("Quality", "")).strip()
 
-    if not download_link or not tmdb_id or not quality:
+    if not tmdb_id:
+        continue
+
+    # Skip duplicates completely
+    dup_check = str(row.get("Duplicate_Check", "")).strip().upper()
+    if dup_check == "DUPLICATE":
+        print(f"Skipping Row {row_idx}: Marked as DUPLICATE.")
+        continue
+
+    # Fetch links
+    links = {
+        "1080p": str(row.get("Link_1080p", "")).strip(),
+        "720p": str(row.get("Link_720p", "")).strip(),
+        "480p": str(row.get("Link_480p", "")).strip()
+    }
+
+    # Fetch existing statuses
+    statuses = {
+        "1080p": str(row.get("DOWNLOAD_STATUS_1080p", "")).strip().lower(),
+        "720p": str(row.get("DOWNLOAD_STATUS_720p", "")).strip().lower(),
+        "480p": str(row.get("DOWNLOAD_STATUS_480p", "")).strip().lower()
+    }
+
+    # Identify variants that actually need processing
+    active_variants = {}
+    for q, link in links.items():
+        if link and statuses[q] != "done":
+            active_variants[q] = link
+
+    if not active_variants:
+        # If everything present in the row has already finished, skip
         continue
 
     print(f"\n{'='*60}")
-    print(f"Row {row_idx}: {tmdb_name} ({year}) — {quality}")
+    print(f"Row {row_idx}: {tmdb_name} ({year}) — Processing qualities: {list(active_variants.keys())}")
     print(f"{'='*60}")
 
-    try:
-        # 1. Download — filename doesn't matter, we rename it after detecting languages
-        temp_path = os.path.join(TEMP_FOLDER, f"movie_{row_idx}.mkv")
-        print(f"    Downloading from: {download_link[:80]}...")
+    errors = []
 
-        if not download_file(download_link, temp_path):
-            raise Exception("Download failed (both aria2c and streaming)")
+    # Map target columns to write to
+    status_col_map = {
+        "1080p": status_1080_col,
+        "720p": status_720_col,
+        "480p": status_480_col
+    }
 
-        # 2. Detect audio languages
-        languages = parse_media_languages(temp_path)
-        print(f"    Detected languages: {languages}")
+    for quality, download_link in active_variants.items():
+        print(f"\n -> Starting {quality}...")
+        temp_path = os.path.join(TEMP_FOLDER, f"movie_{row_idx}_{quality}.mkv")
 
-        # 3. Rename
-        clean_name = build_filename(tmdb_name, year, quality, languages)
-        final_path = os.path.join(OUTPUT_FOLDER, clean_name)
-        shutil.move(temp_path, final_path)
-        print(f"    Renamed to: {clean_name}")
+        try:
+            # 1. Download
+            if not download_file(download_link, temp_path):
+                raise Exception("Download failed (both aria2c and streaming)")
 
-        # 4. Upload to Vidara
-        vidara_url = upload_to_vidara(final_path, clean_name)
-        if not vidara_url:
-            raise Exception("Vidara upload returned no URL")
-        print(f"    Vidara URL: {vidara_url}")
+            # 2. Extract media languages
+            languages = parse_media_languages(temp_path)
+            print(f"    Detected languages: {languages}")
 
-        # 5. Call BEAM worker upsert
-        result = beam_upsert(jwt, tmdb_id, quality, languages, vidara_url)
-        print(f"    DB: {result.get('action', 'unknown')} (link_id: {result.get('id')})")
+            # 3. Build filename & rename
+            clean_name = build_filename(tmdb_name, year, quality, languages)
+            final_path = os.path.join(OUTPUT_FOLDER, clean_name)
+            shutil.move(temp_path, final_path)
+            print(f"    Renamed to: {clean_name}")
 
-        # 6. Write back to sheet
-        sheet.update_cell(row_idx, final_link_col, vidara_url)
-        sheet.update_cell(row_idx, status_col, "Done")
-        sheet.update_cell(row_idx, error_col, "")
+            # 4. Upload
+            vidara_url = upload_to_vidara(final_path, clean_name)
+            if not vidara_url:
+                raise Exception("Vidara upload returned no URL")
+            print(f"    Vidara URL: {vidara_url}")
 
-        processed += 1
+            # 5. DB Upsert
+            result = beam_upsert(jwt, tmdb_id, quality, languages, vidara_url)
+            print(f"    DB Upsert status: {result.get('action', 'unknown')} (link_id: {result.get('id')})")
 
-        # Cleanup
-        if os.path.exists(final_path):
-            os.remove(final_path)
+            # 6. Update individual quality status
+            queue_sheet.update_cell(row_idx, status_col_map[quality], "Done")
+            statuses[quality] = "done"
 
-    except Exception as e:
-        print(f"    [ERROR] {e}")
-        sheet.update_cell(row_idx, status_col, "Failed")
-        sheet.update_cell(row_idx, error_col, str(e)[:500])
-        failed += 1
+            # Clean local files
+            if os.path.exists(final_path):
+                os.remove(final_path)
 
-        # Cleanup temp
-        if os.path.exists(temp_path):
-            try: os.remove(temp_path)
-            except: pass
+        except Exception as variant_error:
+            print(f"    [ERROR ON {quality}]: {variant_error}")
+            queue_sheet.update_cell(row_idx, status_col_map[quality], "Failed")
+            statuses[quality] = "failed"
+            errors.append(f"{quality}: {str(variant_error)}")
 
-print(f"\n{'='*60}")
-print(f"COMPLETE — {processed} processed, {failed} failed")
-print(f"{'='*60}")
+            if os.path.exists(temp_path):
+                try: os.remove(temp_path)
+                except: pass
 
-# Cleanup
+    # Write errors back (if any)
+    if errors:
+        queue_sheet.update_cell(row_idx, error_col, " | ".join(errors)[:500])
+    else:
+        queue_sheet.update_cell(row_idx, error_col, "")
+
+    # ARCHIVE VERIFICATION:
+    # Check if every single quality with an active link has reached "done" state
+    should_archive = True
+    for q, link in links.items():
+        if link and statuses[q] != "done":
+            should_archive = False
+            break
+
+    if should_archive:
+        print(f"\nRow {row_idx} fully processed for all qualities. Archiving...")
+        
+        # Prepare row data to push to Archive worksheet
+        archive_row = [
+            row.get("Filename", ""),
+            row.get("Status", ""),
+            tmdb_id,
+            tmdb_name,
+            year,
+            links["1080p"],
+            links["720p"],
+            links["480p"],
+            "Done" if links["1080p"] else "",
+            "Done" if links["720p"] else "",
+            "Done" if links["480p"] else "",
+            "", # Duplicate check clear
+            ""  # Error clear
+        ]
+        
+        # Write to Archive and clean up the active Queue
+        archive_sheet.append_row(archive_row)
+        queue_sheet.delete_rows(row_idx)
+        print(f"[OK] Archived and cleaned up Row {row_idx} from active workspace")
+
+# Global cleanup of folders
 try:
     shutil.rmtree(OUTPUT_FOLDER)
     shutil.rmtree(TEMP_FOLDER)
 except:
     pass
+
+print(f"\n{'='*60}")
+print("PIPELINE SEQUENCE COMPLETE")
+print(f"{'='*60}")
