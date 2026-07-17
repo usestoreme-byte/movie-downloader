@@ -151,9 +151,9 @@ def build_filename(tmdb_name, year, quality, languages):
     clean_title = clean_string_for_vidara(tmdb_name)
     short_langs = [l[:3] for l in languages]
     if year:
-        name = f"{clean_title} ({year}) {quality} {' + '.join(short_langs)}"
+        name = f"{clean_title} ({year}) {quality} {' + '.join(short_langs)}.mkv"
     else:
-        name = f"{clean_title} {quality} {' + '.join(short_langs)}"
+        name = f"{clean_title} {quality} {' + '.join(short_langs)}.mkv"
     return name
 
 def fetch_vidara_upload_server():
@@ -172,7 +172,7 @@ def upload_to_vidara(file_path, custom_name):
 
     encoder = MultipartEncoder(fields={
         "api_key": VIDARA_API_KEY,
-        "file": (custom_name, open(file_path, "rb"), "video/mp4")
+        "file": (custom_name, open(file_path, "rb"), "video/x-matroska")
     })
     monitor = MultipartEncoderMonitor(encoder)
     response = requests.post(upload_server, data=monitor, headers={"Content-Type": monitor.content_type}, timeout=None)
