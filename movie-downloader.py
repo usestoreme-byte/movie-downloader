@@ -69,6 +69,29 @@ LANG_MAP = {
 
 UNKNOWN_TOKENS = {"", "und", "unknown", "unk", "n/a", "none"}
 
+# 2-letter -> 3-letter ISO 639-2 codes, used to re-tag output stream metadata
+# so Vidara/players show the correct language instead of "Unknown".
+ISO2_TO_ISO3 = {
+    "as": "asm", "te": "tel", "hi": "hin", "ta": "tam", "ml": "mal",
+    "kn": "kan", "bn": "ben", "pa": "pan", "gu": "guj", "mr": "mar",
+    "or": "ori", "en": "eng", "ja": "jpn", "ko": "kor", "es": "spa",
+    "fr": "fre", "de": "ger", "ru": "rus", "zh": "chi", "it": "ita",
+    "pt": "por", "ar": "ara", "tr": "tur",
+}
+
+# language display name -> iso3, built from the maps above, used when we've
+# normalized a track (e.g. unknown subtitle -> "English") and need to stamp
+# a matching iso3 tag rather than trusting whatever the source had.
+NAME_TO_ISO3 = {}
+for _code2, _name in LANG_MAP.items():
+    _iso3 = ISO2_TO_ISO3.get(_code2)
+    if _iso3 and _name not in NAME_TO_ISO3:
+        NAME_TO_ISO3[_name] = _iso3
+
+
+def iso3_for_language(language_name):
+    return NAME_TO_ISO3.get(language_name, "und")
+
 
 # ============================================================================
 # NORMALIZATION
@@ -124,14 +147,15 @@ def inspect_tracks(file_path):
     """
     Returns:
         audio_tracks = [ { "stream_index": int, "language": "English" }, ... ]
-        has_subs      = bool
-    stream_index is the 0-based index WITHIN audio tracks only, matching
-    ffmpeg's `-map 0:a:<stream_index>` addressing.
+        subtitle_tracks = [ { "stream_index": int, "language": "English" }, ... ]
+    stream_index is the 0-based index WITHIN that track type only, matching
+    ffmpeg's `-map 0:a:<stream_index>` / `-map 0:s:<stream_index>` addressing.
     """
     media = MediaInfo.parse(str(file_path))
     audio_tracks = []
-    has_subs = False
+    subtitle_tracks = []
     audio_pos = 0
+    sub_pos = 0
 
     for track in media.tracks:
         if track.track_type == "Audio":
@@ -139,26 +163,38 @@ def inspect_tracks(file_path):
             audio_tracks.append({"stream_index": audio_pos, "language": lang})
             audio_pos += 1
         elif track.track_type == "Text":
-            has_subs = True
+            lang = normalize_subtitle_lang(track.language, getattr(track, "language_full", None))
+            subtitle_tracks.append({"stream_index": sub_pos, "language": lang})
+            sub_pos += 1
 
     if not audio_tracks:
         audio_tracks = [{"stream_index": 0, "language": "Unknown"}]
 
-    return audio_tracks, has_subs
+    return audio_tracks, subtitle_tracks
 
 
 # ============================================================================
 # FFMPEG — remux only, never re-encode
 # ============================================================================
 
-def remux_single_audio(source_path, output_path, audio_stream_index, include_subs):
+def remux_single_audio(source_path, output_path, audio_track, subtitle_tracks):
     """
     Produces exactly one output file containing:
       - the original video stream
       - ONE specific audio stream (by its audio-only index)
       - all subtitle streams from this same source file (if any)
     All streams are stream-copied (-c copy) -> no quality loss, no re-encoding.
+
+    IMPORTANT: we do NOT use a blanket -map_metadata -1. That strips per-stream
+    language tags too (not just the global title), which is what caused
+    subtitles/audio to show as "Unknown" downstream. Instead we only drop the
+    global container metadata, and explicitly stamp each mapped stream with
+    the language we've already normalized/decided on, so the output is always
+    correctly tagged regardless of what the source container had.
     """
+    audio_stream_index = audio_track["stream_index"]
+    audio_iso3 = iso3_for_language(audio_track["language"])
+
     cmd = [
         "ffmpeg", "-y",
         "-i", str(source_path),
@@ -166,14 +202,20 @@ def remux_single_audio(source_path, output_path, audio_stream_index, include_sub
         "-map", f"0:a:{audio_stream_index}",
     ]
 
-    if include_subs:
-        cmd += ["-map", "0:s?"]
+    for sub in subtitle_tracks:
+        cmd += ["-map", f"0:s:{sub['stream_index']}"]
 
-    cmd += [
-        "-c", "copy",
-        "-map_metadata", "-1",
-        str(output_path)
-    ]
+    cmd += ["-c", "copy", "-map_chapters", "-1"]
+
+    # Tag the single output audio stream (always index 0 in the output)
+    cmd += ["-metadata:s:a:0", f"language={audio_iso3}"]
+
+    # Tag each output subtitle stream in the same order they were mapped
+    for out_idx, sub in enumerate(subtitle_tracks):
+        sub_iso3 = iso3_for_language(sub["language"])
+        cmd += [f"-metadata:s:s:{out_idx}", f"language={sub_iso3}"]
+
+    cmd.append(str(output_path))
 
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) < 1024:
@@ -341,12 +383,14 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
             return "Failed", format_error(link_number, None, "Download", "Download failed after retries")
 
         try:
-            audio_tracks, has_subs = inspect_tracks(temp_path)
+            audio_tracks, subtitle_tracks = inspect_tracks(temp_path)
         except Exception as e:
             safe_delete(temp_path)
             return "Failed", format_error(link_number, None, "MediaInfo", str(e))
 
         print(f"       Found audio languages: {[a['language'] for a in audio_tracks]}")
+        if subtitle_tracks:
+            print(f"       Found subtitle languages: {[s['language'] for s in subtitle_tracks]}")
 
         for track in audio_tracks:
             lang = track["language"]
@@ -359,7 +403,7 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
             output_path = os.path.join(OUTPUT_FOLDER, output_name)
 
             try:
-                remux_single_audio(temp_path, output_path, track["stream_index"], has_subs)
+                remux_single_audio(temp_path, output_path, track, subtitle_tracks)
             except Exception as e:
                 safe_delete(output_path)
                 safe_delete(temp_path)
