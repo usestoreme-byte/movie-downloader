@@ -12,7 +12,6 @@ import re
 import json
 import shutil
 import requests
-import time
 import subprocess
 from pathlib import Path
 import gspread
@@ -57,69 +56,6 @@ LANG_MAP = {
     "fr": "French", "de": "German", "ru": "Russian", "zh": "Chinese", "it": "Italian",
     "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish",
 }
-
-# ============================================================================
-# GOOGLE SHEETS AUTH & DATA EXTRACTION
-# ============================================================================
-print("=" * 60)
-print("BEAM MOVIE DOWNLOADER — STARTING MULTI-QUALITY QUEUE RUN")
-print("=" * 60)
-
-try:
-    raw_json_str = os.environ.get("GOOGLE_SHEETS_JSON")
-    if not raw_json_str:
-        raise ValueError("GOOGLE_SHEETS_JSON is missing.")
-    creds_dict = json.loads(raw_json_str)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
-    gc = gspread.authorize(creds)
-    print("[OK] Connected to Google Sheets API")
-except Exception as auth_err:
-    print(f"[CRITICAL] Auth failed: {auth_err}")
-    raise
-
-# Explicitly open workbooks
-spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-try:
-    queue_sheet = spreadsheet.worksheet("Queue")
-    archive_sheet = spreadsheet.worksheet("Archive")
-    print("[OK] Loaded worksheets: Queue & Archive")
-except Exception:
-    queue_sheet = spreadsheet.get_worksheet(0)
-    archive_sheet = spreadsheet.get_worksheet(1)
-    print(f"[WARN] Tab named 'Queue' or 'Archive' not found. Falling back to sheets at indices 0 and 1.")
-
-# Get all values from active Queue
-raw_values = queue_sheet.get_all_values()
-if not raw_values:
-    raise Exception("The Queue worksheet is completely empty!")
-
-headers = [h.strip() if isinstance(h, str) else h for h in raw_values[0]]
-
-# Map indices dynamically (1-based for updates)
-try:
-    tmdb_id_col = headers.index("TMDB_ID") + 1                    # C
-    tmdb_name_col = headers.index("TMDB_NAME") + 1                # D
-    year_col = headers.index("YEAR") + 1                          # E
-    
-    link_1080_col = headers.index("Link_1080p") + 1               # F
-    link_720_col = headers.index("Link_720p") + 1                 # G
-    link_480_col = headers.index("Link_480p") + 1                 # H
-    
-    status_1080_col = headers.index("DOWNLOAD_STATUS_1080p") + 1  # I
-    status_720_col = headers.index("DOWNLOAD_STATUS_720p") + 1    # J
-    status_480_col = headers.index("DOWNLOAD_STATUS_480p") + 1    # K
-    
-    dup_col = headers.index("Duplicate_Check") + 1                # L
-    error_col = headers.index("Error") + 1                        # M
-except ValueError as e:
-    raise Exception(f"Missing column header in layout: {e}. Current headers: {headers}")
-
-# Structure data rows
-all_rows = []
-for row_cells in raw_values[1:]:
-    padded_row = row_cells + [""] * (len(headers) - len(row_cells))
-    row_dict = {headers[i]: padded_row[i] for i in range(len(headers)) if headers[i] != ""}
-    all_rows.append(row_dict)
 
 # ============================================================================
 # HELPERS
@@ -180,7 +116,8 @@ def upload_to_vidara(file_path, custom_name):
 
     if response.status_code == 200:
         data = response.json()
-        return data.get("filecode") or data.get("url") or data.get("result", {}).get("url")
+        filecode = data.get("filecode") or data.get("url") or data.get("result", {}).get("url") or data.get("result", {}).get("filecode")
+        return filecode
     else:
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
 
@@ -233,11 +170,75 @@ def download_file(url, dest_path):
 # ============================================================================
 # MAIN MULTI-QUALITY PIPELINE
 # ============================================================================
+print("=" * 60)
+print("BEAM MOVIE DOWNLOADER — STARTING MULTI-QUALITY QUEUE RUN")
+print("=" * 60)
+
+try:
+    raw_json_str = os.environ.get("GOOGLE_SHEETS_JSON")
+    if not raw_json_str:
+        raise ValueError("GOOGLE_SHEETS_JSON is missing.")
+    creds_dict = json.loads(raw_json_str)
+    creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
+    gc = gspread.authorize(creds)
+    print("[OK] Connected to Google Sheets API")
+except Exception as auth_err:
+    print(f"[CRITICAL] Auth failed: {auth_err}")
+    raise
+
+spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+try:
+    queue_sheet = spreadsheet.worksheet("Queue")
+    archive_sheet = spreadsheet.worksheet("Archive")
+    print("[OK] Loaded worksheets: Queue & Archive")
+except Exception:
+    queue_sheet = spreadsheet.get_worksheet(0)
+    archive_sheet = spreadsheet.get_worksheet(1)
+    print(f"[WARN] Specific named tabs not found. Falling back to indices 0 and 1.")
+
+raw_values = queue_sheet.get_all_values()
+if not raw_values:
+    raise Exception("The Queue worksheet is completely empty!")
+
+headers = [h.strip() for h in raw_values[0]]
+
+# Map indices dynamically based on actual header values
+try:
+    filename_col = headers.index("Filename") + 1
+    status_col = headers.index("Status") + 1
+    tmdb_id_col = headers.index("TMDB_ID") + 1
+    tmdb_name_col = headers.index("TMDB_NAME") + 1
+    year_col = headers.index("YEAR") + 1
+    
+    link_1080_col = headers.index("Link_1080p") + 1
+    link_720_col = headers.index("Link_720p") + 1
+    link_480_col = headers.index("Link_480p") + 1
+    
+    status_1080_col = headers.index("DOWNLOAD_STATUS_1080p") + 1
+    status_720_col = headers.index("DOWNLOAD_STATUS_720p") + 1
+    status_480_col = headers.index("DOWNLOAD_STATUS_480p") + 1
+    
+    dup_col = headers.index("Duplicate_Check") + 1
+    error_col = headers.index("Error") + 1
+except ValueError as e:
+    raise Exception(f"Missing column header configuration: {e}. Available headers: {headers}")
+
+all_rows = []
+for row_cells in raw_values[1:]:
+    padded_row = row_cells + [""] * (len(headers) - len(row_cells))
+    row_dict = {headers[i]: padded_row[i] for i in range(len(headers)) if headers[i] != ""}
+    all_rows.append(row_dict)
+
 print(f"\nProcessing {len(all_rows)} rows...")
 
-jwt = beam_login()
-print("[OK] Logged into BEAM worker\n")
+try:
+    jwt = beam_login()
+    print("[OK] Logged into BEAM worker\n")
+except Exception as login_err:
+    print(f"[CRITICAL] BEAM Engine authentication failed: {login_err}")
+    raise
 
+# Iterate backwards to maintain correct structural deletions safely
 for idx in range(len(all_rows) - 1, -1, -1):
     row = all_rows[idx]
     row_idx = idx + 2
@@ -293,7 +294,7 @@ for idx in range(len(all_rows) - 1, -1, -1):
 
         try:
             if not download_file(download_link, temp_path):
-                raise Exception("Download failed")
+                raise Exception("Download stage execution failed.")
 
             languages = parse_media_languages(temp_path)
             print(f"    Detected languages: {languages}")
@@ -305,8 +306,8 @@ for idx in range(len(all_rows) - 1, -1, -1):
 
             vidara_url = upload_to_vidara(final_path, clean_name)
             if not vidara_url:
-                raise Exception("Vidara upload returned no URL")
-            print(f"    Vidara URL: {vidara_url}")
+                raise Exception("Vidara upload execution returned no valid code/URL")
+            print(f"    Vidara File Identifier/URL: {vidara_url}")
 
             result = beam_upsert(jwt, tmdb_id, quality, languages, vidara_url)
             print(f"    DB Upsert status: {result.get('action', 'unknown')} (link_id: {result.get('id')})")
@@ -328,19 +329,19 @@ for idx in range(len(all_rows) - 1, -1, -1):
                 try: os.remove(temp_path)
                 except: pass
 
+    # Error handling reflection logic
     if errors:
         queue_sheet.update_cell(row_idx, error_col, " | ".join(errors)[:500])
     else:
         queue_sheet.update_cell(row_idx, error_col, "")
 
-    # ARCHIVE LOGIC FIX:
-    # Explicitly calculate column alignment structure arrays to prevent horizontal cell offsets
+    # Calculate overall completeness metrics
     total_links_count = sum(1 for link in links.values() if link)
     done_links_count = sum(1 for q, link in links.items() if link and statuses[q] == "done")
 
-    # Scenario A: All present links are fully done!
+    # Scenario A: All valid inputs are verified as "Done"
     if total_links_count > 0 and done_links_count == total_links_count:
-        print(f"\nRow {row_idx} fully completed ({done_links_count}/{total_links_count}). Archiving...")
+        print(f"\nRow {row_idx} fully completed ({done_links_count}/{total_links_count}). Archiving entry...")
         
         archive_row = [
             row.get("Filename", ""),
@@ -354,18 +355,17 @@ for idx in range(len(all_rows) - 1, -1, -1):
             "Done" if links["1080p"] else "",
             "Done" if links["720p"] else "",
             "Done" if links["480p"] else "",
-            "", 
-            ""  
+            row.get("Duplicate_Check", ""),
+            ""
         ]
         
-        # Explicit structure value input option preserves exact multi-column dimensions starting from Column A
         archive_sheet.append_row(archive_row, value_input_option="USER_ENTERED")
         queue_sheet.delete_rows(row_idx)
-        print(f"[OK] Row {row_idx} archived and removed from active Queue.")
+        print(f"[OK] Row {row_idx} fully processed and dropped from active operational Queue.")
 
-    # Scenario B: Partial completion.
+    # Scenario B: Partial updates completed
     elif len(newly_finished) > 0:
-        print(f"\nRow {row_idx} has partial progress. Archiving completed metrics...")
+        print(f"\nRow {row_idx} has logged partial success. Writing completed variants to Archive...")
         
         archive_row = [
             row.get("Filename", ""),
@@ -379,14 +379,14 @@ for idx in range(len(all_rows) - 1, -1, -1):
             "Done" if statuses["1080p"] == "done" else "",
             "Done" if statuses["720p"] == "done" else "",
             "Done" if statuses["480p"] == "done" else "",
-            "",
-            ""
+            row.get("Duplicate_Check", ""),
+            "Partial processing completed"
         ]
         
         archive_sheet.append_row(archive_row, value_input_option="USER_ENTERED")
-        print(f"[OK] Partially completed variants archived cleanly from A-M.")
+        print(f"[OK] Logged updates successfully for variants: {newly_finished}.")
 
-# Global cleanup of folders
+# Global cleanups
 try:
     shutil.rmtree(OUTPUT_FOLDER)
     shutil.rmtree(TEMP_FOLDER)
