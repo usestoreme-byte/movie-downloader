@@ -30,6 +30,7 @@ import json
 import shutil
 import requests
 import subprocess
+import time
 from pathlib import Path
 import gspread
 from google.oauth2.service_account import Credentials
@@ -45,6 +46,16 @@ SCOPES = [
 ]
 
 VIDARA_API_KEY = os.environ.get("VIDARA_API_KEY", "").strip()
+
+# Internet Archive S3-style credentials, used to host extracted English
+# subtitles so Vidara can fetch them by direct URL.
+# SECURITY NOTE: hardcoded here only for quick testing — swap these for a
+# GitHub Secret (IA_ACCESS_KEY / IA_SECRET_KEY, same pattern as
+# VIDARA_API_KEY above) before running this long-term. Anyone with read
+# access to this file/repo gets full write access to your IA account
+# with these sitting here in plain text.
+IA_ACCESS_KEY = os.environ.get("IA_ACCESS_KEY", "EQ6XJ3AACbxfK4n7").strip()
+IA_SECRET_KEY = os.environ.get("IA_SECRET_KEY", "BlzN7vT0uJo7g3n2").strip()
 
 RAW_SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID", "")
 SPREADSHEET_ID = RAW_SPREADSHEET_ID.replace("'", "").replace('"', '').strip()
@@ -256,6 +267,30 @@ def fetch_vidara_upload_server():
         return "https://api.vidara.so/v1/upload/server"
 
 
+def extract_bare_filecode(data):
+    """
+    Vidara's upload response has been observed in two shapes:
+      1. {"filecode": "AbC123xY", "url": "https://vidara.so/v/AbC123xY", ...}  (documented)
+      2. {"url": "https://vidaraa.cc/e/AbC123xY", ...}  (no top-level filecode,
+         and a different embed domain — seen in practice)
+    The subtitle-attach API strictly needs the BARE code, not a full URL, so
+    always resolve down to just that final path segment.
+    """
+    candidate = (
+        data.get("filecode")
+        or data.get("result", {}).get("filecode")
+        or data.get("url")
+        or data.get("result", {}).get("url")
+    )
+    if not candidate:
+        raise Exception(f"Vidara upload returned no filecode/url: {data}")
+
+    if "/" in candidate:
+        candidate = candidate.rstrip("/").split("/")[-1]
+
+    return candidate
+
+
 def upload_to_vidara(file_path, custom_name):
     upload_server = fetch_vidara_upload_server()
     print(f"    Uploading to Vidara: {custom_name} ({round(os.path.getsize(file_path) / 1048576, 1)} MB)")
@@ -270,17 +305,142 @@ def upload_to_vidara(file_path, custom_name):
 
     if response.status_code == 200:
         data = response.json()
-        filecode = (
-            data.get("filecode")
-            or data.get("url")
-            or data.get("result", {}).get("url")
-            or data.get("result", {}).get("filecode")
-        )
-        if not filecode:
-            raise Exception(f"Vidara upload returned no filecode/url: {data}")
-        return filecode
+        return extract_bare_filecode(data)
     else:
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
+
+
+# ============================================================================
+# SUBTITLES — extract English tracks only, host them permanently and freely
+# on Internet Archive, then tell Vidara to attach that URL to the uploaded
+# video's filecode. Extracting straight from the same source file we split
+# the audio from guarantees the subtitle timing matches — no separate
+# re-sync possible.
+# ============================================================================
+
+def extract_subtitle_to_srt(source_path, subtitle_stream_index, output_srt_path):
+    """
+    Pulls ONE subtitle stream out of the source file as a standalone .srt.
+    Text-based subtitle codecs (srt/ass/webvtt/etc.) convert to srt cleanly
+    via -c:s srt. If a track is image-based (e.g. PGS/VobSub) ffmpeg can't
+    convert it to srt and this will fail — that's expected and handled by
+    the caller as a skip, not a hard error.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(source_path),
+        "-map", f"0:s:{subtitle_stream_index}",
+        "-c:s", "srt",
+        str(output_srt_path)
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0 or not os.path.exists(output_srt_path) or os.path.getsize(output_srt_path) < 10:
+        raise Exception(f"ffmpeg subtitle extraction failed: {result.stderr[-300:] if result.stderr else 'unknown error'}")
+    return True
+
+
+def slugify_for_ia(text, max_len=80):
+    """
+    Internet Archive item/bucket identifiers and S3 keys only allow
+    alphanumerics, -, _, . — anything else gets collapsed to a dash.
+    """
+    text = re.sub(r'[^a-zA-Z0-9\-_.]', '-', text or "")
+    text = re.sub(r'-+', '-', text).strip('-_.')
+    return (text.lower() or "item")[:max_len]
+
+
+def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="application/x-subrip", wait_seconds=60):
+    """
+    Uploads via Internet Archive's S3-compatible endpoint. `bucket_hint`
+    should be stable per movie so multiple subtitle files land in the same
+    IA "item" instead of creating a new one per file. x-amz-auto-make-bucket
+    creates that item automatically if it doesn't exist yet. Storage is
+    free and permanent — no expiry to manage.
+
+    IA can take anywhere from a few seconds to a couple minutes to make a
+    freshly uploaded file publicly fetchable, so this polls the direct
+    download URL briefly before handing it back — Vidara needs to fetch it
+    immediately, so handing back a URL that 404s yet would just move the
+    same failure mode over to a different host.
+    """
+    bucket = slugify_for_ia(f"beamplay-subs-{bucket_hint}")
+    key = slugify_for_ia(key_hint) + ".srt"
+    upload_url = f"https://s3.us.archive.org/{bucket}/{key}"
+
+    headers = {
+        "authorization": f"LOW {IA_ACCESS_KEY}:{IA_SECRET_KEY}",
+        "x-amz-auto-make-bucket": "1",
+        "x-archive-meta-mediatype": "texts",
+        "x-archive-meta-collection": "opensource",
+        "x-archive-ignore-preexisting-bucket": "1",
+        "Content-Type": content_type,
+    }
+
+    with open(file_path, "rb") as fh:
+        data = fh.read()
+
+    response = requests.put(upload_url, data=data, headers=headers, timeout=60)
+    if response.status_code not in (200, 201):
+        raise Exception(f"Archive.org upload failed: {response.status_code} {response.text[:200]}")
+
+    direct_url = f"https://archive.org/download/{bucket}/{key}"
+
+    attempts = max(1, wait_seconds // 5)
+    for _ in range(attempts):
+        try:
+            check = requests.head(direct_url, timeout=10, allow_redirects=True)
+            if check.status_code == 200:
+                return direct_url
+        except Exception:
+            pass
+        time.sleep(5)
+
+    print(f"       [WARN] Archive.org file not confirmed reachable after {wait_seconds}s, proceeding anyway: {direct_url}")
+    return direct_url
+
+
+def attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English"):
+    res = requests.get(
+        "https://api.vidara.so/v1/upload/sub",
+        params={"api_key": VIDARA_API_KEY, "filecode": filecode, "sub_lang": sub_lang, "sub_url": sub_url},
+        timeout=30
+    )
+    res.raise_for_status()
+    data = res.json()
+    if data.get("status") != 200:
+        raise Exception(f"Vidara subtitle attach failed: {data}")
+    return True
+
+
+def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp_prefix):
+    """
+    Extracts every subtitle track normalized to 'English', uploads each to
+    Internet Archive (one IA "item" per bucket_hint, reused across every
+    subtitle for that movie instead of creating a new item per file), and
+    returns (urls, failure_reasons). Best-effort: a track that fails to
+    extract/upload is skipped (reason recorded) rather than aborting the
+    whole link — the video itself matters more than a caption attach.
+    """
+    urls = []
+    failures = []
+    english_tracks = [s for s in subtitle_tracks if s["language"] == "English"]
+    if not english_tracks:
+        return urls, failures
+
+    for idx, sub in enumerate(english_tracks):
+        srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
+        try:
+            extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
+            url = upload_to_archive_org(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
+            urls.append(url)
+            print(f"       [SUB] English subtitle #{idx+1} hosted -> {url}")
+        except Exception as e:
+            failures.append(f"track #{idx+1}: {e}")
+            print(f"       [WARN] Could not prepare English subtitle #{idx+1}: {e}")
+        finally:
+            safe_delete(srt_path)
+
+    return urls, failures
 
 
 def beam_login():
@@ -357,16 +517,20 @@ def format_error(link_number, language, stage, reason):
 
 def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
     """
-    Returns (status, error_text)
+    Returns (status, error_text, subtitle_warnings)
         status = "Done" or "Failed"
         error_text = "" on success, formatted failure detail otherwise
+        subtitle_warnings = list of human-readable notes for captions that
+            didn't attach (video still uploaded fine) — includes the direct
+            Archive.org link so it can be downloaded and attached by hand.
     Never raises — all failures are caught and turned into a status/error pair.
     """
     links = [l.strip() for l in links_raw.splitlines() if l.strip()]
     if not links:
-        return "Done", ""  # nothing to do for this quality
+        return "Done", "", []  # nothing to do for this quality
 
     processed_languages = set()
+    subtitle_warnings = []
 
     for link_number, link in enumerate(links, start=1):
         temp_path = os.path.join(TEMP_FOLDER, f"row{row_idx}_{quality}_link{link_number}.mkv")
@@ -376,21 +540,32 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
             ok = download_file(link, temp_path)
         except Exception as e:
             safe_delete(temp_path)
-            return "Failed", format_error(link_number, None, "Download", str(e))
+            return "Failed", format_error(link_number, None, "Download", str(e)), subtitle_warnings
 
         if not ok:
             safe_delete(temp_path)
-            return "Failed", format_error(link_number, None, "Download", "Download failed after retries")
+            return "Failed", format_error(link_number, None, "Download", "Download failed after retries"), subtitle_warnings
 
         try:
             audio_tracks, subtitle_tracks = inspect_tracks(temp_path)
         except Exception as e:
             safe_delete(temp_path)
-            return "Failed", format_error(link_number, None, "MediaInfo", str(e))
+            return "Failed", format_error(link_number, None, "MediaInfo", str(e)), subtitle_warnings
 
         print(f"       Found audio languages: {[a['language'] for a in audio_tracks]}")
         if subtitle_tracks:
             print(f"       Found subtitle languages: {[s['language'] for s in subtitle_tracks]}")
+
+        # Extract + host every English subtitle track ONCE per link — same
+        # captions get attached to every audio-language video we upload
+        # below, so there's no need to redo this per audio track.
+        subtitle_urls, prep_failures = prepare_english_subtitle_urls(
+            temp_path, subtitle_tracks, f"{tmdb_id}", f"{tmdb_id}_{quality}_link{link_number}"
+        )
+        for fail_reason in prep_failures:
+            subtitle_warnings.append(
+                f"{quality} Link #{link_number}: could not extract/host English subtitle — {fail_reason}"
+            )
 
         for track in audio_tracks:
             lang = track["language"]
@@ -403,27 +578,41 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
             output_path = os.path.join(OUTPUT_FOLDER, output_name)
 
             try:
-                remux_single_audio(temp_path, output_path, track, subtitle_tracks)
+                remux_single_audio(temp_path, output_path, track, [])  # subs handled via API below, not embedded
             except Exception as e:
                 safe_delete(output_path)
                 safe_delete(temp_path)
-                return "Failed", format_error(link_number, lang, "FFmpeg Remux", str(e))
+                return "Failed", format_error(link_number, lang, "FFmpeg Remux", str(e)), subtitle_warnings
 
             try:
-                vidara_url = upload_to_vidara(output_path, output_name)
-                beam_upsert(jwt, tmdb_id, quality, lang, vidara_url)
+                filecode = upload_to_vidara(output_path, output_name)
+                beam_upsert(jwt, tmdb_id, quality, lang, filecode)
             except Exception as e:
                 safe_delete(output_path)
                 safe_delete(temp_path)
-                return "Failed", format_error(link_number, lang, "Vidara Upload / BEAM Upsert", str(e))
+                return "Failed", format_error(link_number, lang, "Vidara Upload / BEAM Upsert", str(e)), subtitle_warnings
 
             safe_delete(output_path)
             processed_languages.add(lang)
             print(f"       [OK] {lang} uploaded and registered.")
 
+            # Best-effort: attach every prepared English subtitle to this filecode.
+            for sub_url in subtitle_urls:
+                try:
+                    attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English")
+                    print(f"       [SUB] Attached English caption to {filecode}")
+                except Exception as e:
+                    warning = (
+                        f"{quality} Link #{link_number} [{lang}] filecode {filecode}: "
+                        f"video uploaded OK but subtitle attach failed ({e}). "
+                        f"Download the caption yourself here: {sub_url}"
+                    )
+                    subtitle_warnings.append(warning)
+                    print(f"       [WARN] {warning}")
+
         safe_delete(temp_path)
 
-    return "Done", ""
+    return "Done", "", subtitle_warnings
 
 
 # ============================================================================
@@ -507,6 +696,7 @@ def main():
         print(f"\n{'='*60}\nRow {row_idx}: {tmdb_name} ({year})\n{'='*60}")
 
         row_final_statuses = {}
+        row_final_errors = {}
 
         for quality, link_col_name, status_col_name, error_col_name in QUALITIES:
             link_cell = str(row.get(link_col_name, "")).strip()
@@ -514,10 +704,14 @@ def main():
 
             if not link_cell:
                 row_final_statuses[quality] = current_status or ""
+                row_final_errors[quality] = str(row.get(error_col_name, "")).strip()
                 continue
 
             if current_status == "done":
                 row_final_statuses[quality] = "done"
+                # Preserve any existing note (e.g. a past subtitle warning)
+                # for a quality we're not touching again this run.
+                row_final_errors[quality] = str(row.get(error_col_name, "")).strip()
                 continue
 
             print(f"\n -> {quality}: starting (current status: '{current_status or 'empty'}')")
@@ -525,19 +719,30 @@ def main():
             # Checkpoint write: Running
             queue_sheet.update_cell(row_idx, cols[status_col_name], "Running")
 
-            status, error_text = process_quality(
+            status, error_text, subtitle_warnings = process_quality(
                 jwt, tmdb_id, tmdb_name, year, quality, link_cell, row_idx
             )
 
             if status == "Done":
-                # Checkpoint write: Done + clear error
                 queue_sheet.update_cell(row_idx, cols[status_col_name], "Done")
-                queue_sheet.update_cell(row_idx, cols[error_col_name], "")
-                print(f"    [DONE] {quality} completed successfully.")
+                if subtitle_warnings:
+                    # Still Done — video uploaded fine. Error just notes
+                    # which captions need manual attaching, with the direct
+                    # download link for each one.
+                    note = "DONE — but some subtitles need manual attach:\n\n" + "\n\n".join(subtitle_warnings)
+                    note = note[:1500]
+                    queue_sheet.update_cell(row_idx, cols[error_col_name], note)
+                    row_final_errors[quality] = note
+                    print(f"    [DONE with subtitle warnings] {quality}")
+                else:
+                    queue_sheet.update_cell(row_idx, cols[error_col_name], "")
+                    row_final_errors[quality] = ""
+                    print(f"    [DONE] {quality} completed successfully.")
             else:
                 # Checkpoint write: Failed + error detail
                 queue_sheet.update_cell(row_idx, cols[status_col_name], "Failed")
                 queue_sheet.update_cell(row_idx, cols[error_col_name], error_text)
+                row_final_errors[quality] = error_text
                 print(f"    [FAILED] {quality}:\n{error_text}")
 
             row_final_statuses[quality] = status.lower()
@@ -561,7 +766,9 @@ def main():
                 "Done" if row.get("Link_720p", "").strip() else "",
                 "Done" if row.get("Link_480p", "").strip() else "",
                 row.get("Duplicate_Check", ""),
-                "", "", ""
+                row_final_errors.get("1080p", ""),
+                row_final_errors.get("720p", ""),
+                row_final_errors.get("480p", ""),
             ]
             archive_sheet.append_row(archive_row, value_input_option="USER_ENTERED")
             queue_sheet.delete_rows(row_idx)
