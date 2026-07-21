@@ -267,28 +267,31 @@ def fetch_vidara_upload_server():
         return "https://api.vidara.so/v1/upload/server"
 
 
-def extract_bare_filecode(data):
+def extract_vidara_urls(data):
     """
-    Vidara's upload response has been observed in two shapes:
-      1. {"filecode": "AbC123xY", "url": "https://vidara.so/v/AbC123xY", ...}  (documented)
-      2. {"url": "https://vidaraa.cc/e/AbC123xY", ...}  (no top-level filecode,
-         and a different embed domain — seen in practice)
-    The subtitle-attach API strictly needs the BARE code, not a full URL, so
-    always resolve down to just that final path segment.
+    Returns (full_url, bare_filecode).
+
+    full_url: whatever URL Vidara actually returned in `url` (or
+    result.url), stored AS-IS into BEAM — Vidara's embed domain has changed
+    more than once (vidara.so -> vidaraa.cc -> vidara.to), so reconstructing
+    or hardcoding a domain is fragile. Store exactly what they give back.
+
+    bare_filecode: just the last path segment, needed ONLY internally for
+    the subtitle-attach API, which requires the bare code rather than a URL.
     """
-    candidate = (
-        data.get("filecode")
-        or data.get("result", {}).get("filecode")
-        or data.get("url")
-        or data.get("result", {}).get("url")
-    )
-    if not candidate:
-        raise Exception(f"Vidara upload returned no filecode/url: {data}")
+    full_url = data.get("url") or data.get("result", {}).get("url")
+    filecode = data.get("filecode") or data.get("result", {}).get("filecode")
 
-    if "/" in candidate:
-        candidate = candidate.rstrip("/").split("/")[-1]
+    if not full_url and not filecode:
+        raise Exception(f"Vidara upload returned no url/filecode: {data}")
 
-    return candidate
+    if not full_url:
+        full_url = filecode
+
+    if not filecode:
+        filecode = full_url.rstrip("/").split("/")[-1]
+
+    return full_url, filecode
 
 
 def upload_to_vidara(file_path, custom_name):
@@ -305,7 +308,7 @@ def upload_to_vidara(file_path, custom_name):
 
     if response.status_code == 200:
         data = response.json()
-        return extract_bare_filecode(data)
+        return extract_vidara_urls(data)  # (full_url, filecode)
     else:
         raise Exception(f"Vidara upload failed: {response.status_code} {response.text[:200]}")
 
@@ -585,8 +588,8 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
                 return "Failed", format_error(link_number, lang, "FFmpeg Remux", str(e)), subtitle_warnings
 
             try:
-                filecode = upload_to_vidara(output_path, output_name)
-                beam_upsert(jwt, tmdb_id, quality, lang, filecode)
+                video_url, filecode = upload_to_vidara(output_path, output_name)
+                beam_upsert(jwt, tmdb_id, quality, lang, video_url)
             except Exception as e:
                 safe_delete(output_path)
                 safe_delete(temp_path)
@@ -594,7 +597,7 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
 
             safe_delete(output_path)
             processed_languages.add(lang)
-            print(f"       [OK] {lang} uploaded and registered.")
+            print(f"       [OK] {lang} uploaded and registered ({video_url}).")
 
             # Best-effort: attach every prepared English subtitle to this filecode.
             for sub_url in subtitle_urls:
@@ -603,7 +606,7 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
                     print(f"       [SUB] Attached English caption to {filecode}")
                 except Exception as e:
                     warning = (
-                        f"{quality} Link #{link_number} [{lang}] filecode {filecode}: "
+                        f"{quality} Link #{link_number} [{lang}] video {video_url} (filecode {filecode}): "
                         f"video uploaded OK but subtitle attach failed ({e}). "
                         f"Download the caption yourself here: {sub_url}"
                     )
