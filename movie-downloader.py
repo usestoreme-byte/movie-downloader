@@ -618,6 +618,15 @@ def main():
     def col(name):
         return headers.index(name) + 1
 
+    # Archive tab may have its own column order (and possibly extra/missing
+    # columns) versus Queue — never assume it matches. We build each archive
+    # row by looking up values against Archive's OWN header row, not by a
+    # fixed position list, so nothing silently shifts into the wrong column.
+    archive_headers_raw = archive_sheet.row_values(1)
+    archive_headers = [h.strip() for h in archive_headers_raw]
+    if not archive_headers:
+        raise Exception("Archive worksheet has no header row.")
+
     required = [
         "Filename", "Status", "TMDB_ID", "TMDB_NAME", "YEAR",
         "Link_1080p", "Link_720p", "Link_480p",
@@ -716,23 +725,31 @@ def main():
 
         if all_done:
             print(f"\nRow {row_idx} fully completed. Archiving...")
-            archive_row = [
-                row.get("Filename", ""),
-                row.get("Status", ""),
-                tmdb_id,
-                tmdb_name,
-                year,
-                row.get("Link_1080p", ""),
-                row.get("Link_720p", ""),
-                row.get("Link_480p", ""),
-                "Done" if row.get("Link_1080p", "").strip() else "",
-                "Done" if row.get("Link_720p", "").strip() else "",
-                "Done" if row.get("Link_480p", "").strip() else "",
-                row.get("Duplicate_Check", ""),
-                row_final_errors.get("1080p", ""),
-                row_final_errors.get("720p", ""),
-                row_final_errors.get("480p", ""),
-            ]
+
+            # Build values by FIELD NAME first...
+            archive_values_by_name = {
+                "Filename": row.get("Filename", ""),
+                "Status": row.get("Status", ""),
+                "TMDB_ID": tmdb_id,
+                "TMDB_NAME": tmdb_name,
+                "YEAR": year,
+                "Link_1080p": row.get("Link_1080p", ""),
+                "Link_720p": row.get("Link_720p", ""),
+                "Link_480p": row.get("Link_480p", ""),
+                "DOWNLOAD_STATUS_1080p": "Done" if row.get("Link_1080p", "").strip() else "",
+                "DOWNLOAD_STATUS_720p": "Done" if row.get("Link_720p", "").strip() else "",
+                "DOWNLOAD_STATUS_480p": "Done" if row.get("Link_480p", "").strip() else "",
+                "Duplicate_Check": row.get("Duplicate_Check", ""),
+                "ERROR_1080p": row_final_errors.get("1080p", ""),
+                "ERROR_720p": row_final_errors.get("720p", ""),
+                "ERROR_480p": row_final_errors.get("480p", ""),
+            }
+
+            # ...then place them according to Archive's OWN header order.
+            # Any Archive column not in the map above (e.g. a manually added
+            # column) is just left blank instead of shifting other values.
+            archive_row = [archive_values_by_name.get(h, "") for h in archive_headers]
+
             archive_sheet.append_row(archive_row, value_input_option="USER_ENTERED")
             queue_sheet.delete_rows(row_idx)
             print(f"[OK] Row {row_idx} archived and removed from Queue.")
