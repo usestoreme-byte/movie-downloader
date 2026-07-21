@@ -403,47 +403,136 @@ def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="applic
 
 
 def attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English"):
-    res = requests.get(
-        "https://api.vidara.so/v1/upload/sub",
-        params={"api_key": VIDARA_API_KEY, "filecode": filecode, "sub_lang": sub_lang, "sub_url": sub_url},
-        timeout=30
-    )
-    res.raise_for_status()
-    data = res.json()
+    """
+    Raises a SHORT, clean exception on failure — never the raw response
+    (which would otherwise include the full request URL, and therefore
+    your Vidara API key in plaintext, in whatever error text ends up in
+    the sheet).
+    """
+    try:
+        res = requests.get(
+            "https://api.vidara.so/v1/upload/sub",
+            params={"api_key": VIDARA_API_KEY, "filecode": filecode, "sub_lang": sub_lang, "sub_url": sub_url},
+            timeout=30
+        )
+    except requests.exceptions.RequestException as e:
+        raise Exception(f"network error ({type(e).__name__})")
+
+    if res.status_code != 200:
+        raise Exception(f"HTTP {res.status_code}")
+
+    try:
+        data = res.json()
+    except ValueError:
+        raise Exception(f"HTTP {res.status_code}, non-JSON response")
+
     if data.get("status") != 200:
-        raise Exception(f"Vidara subtitle attach failed: {data}")
+        raise Exception(f"Vidara status {data.get('status')}: {str(data.get('msg', 'no message'))[:150]}")
+
     return True
+
+
+LITTERBOX_API = "https://litterbox.catbox.moe/resources/internals/api.php"
+
+
+def upload_to_litterbox(file_path, expire="72h"):
+    """
+    Second hosting copy, uploaded alongside Archive.org (not just as a
+    fallback-on-exception) — some Vidara-side attach failures turn out to
+    be Vidara's own fetcher choking on something Archive.org-specific, so
+    having a second, differently-hosted copy ready to try is what actually
+    resolves those, not just retrying the same URL. Free, no-signup,
+    temporary (72h is plenty for a subtitle to get attached).
+    """
+    with open(file_path, "rb") as fh:
+        response = requests.post(
+            LITTERBOX_API,
+            data={"reqtype": "fileupload", "time": expire},
+            files={"fileToUpload": fh},
+            timeout=30
+        )
+    response.raise_for_status()
+    url = response.text.strip()
+    if not url.startswith("http"):
+        raise Exception(f"Litterbox did not return a URL: {url[:200]}")
+    return url
+
+
+def host_subtitle_everywhere(srt_path, bucket_hint, key_hint):
+    """
+    Hosts the same .srt on BOTH Archive.org and Litterbox (not one-then-
+    fallback) — whichever succeed get returned as a list of (url, host)
+    pairs, so the caller can try attaching with each one until one works.
+    Raises only if BOTH hosts fail.
+    """
+    hosted = []
+    errors = []
+
+    try:
+        url = upload_to_archive_org(srt_path, bucket_hint, key_hint)
+        hosted.append((url, "Archive.org"))
+    except Exception as e:
+        errors.append(f"Archive.org: {e}")
+
+    try:
+        url = upload_to_litterbox(srt_path)
+        hosted.append((url, "Litterbox"))
+    except Exception as e:
+        errors.append(f"Litterbox: {e}")
+
+    if not hosted:
+        raise Exception(" | ".join(errors))
+
+    return hosted
+
+
+def attach_first_working(filecode, hosted_urls, sub_lang="English"):
+    """
+    Tries attaching each (url, host) pair in order until Vidara accepts
+    one. Returns the host name that worked. If all fail, raises a single
+    clean summary — no leaked keys, no raw query strings.
+    """
+    attempts = []
+    for url, host in hosted_urls:
+        try:
+            attach_subtitle_to_vidara(filecode, url, sub_lang)
+            return host
+        except Exception as e:
+            attempts.append(f"{host} ({e})")
+
+    raise Exception("all hosts failed: " + "; ".join(attempts))
 
 
 def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp_prefix):
     """
-    Extracts every subtitle track normalized to 'English', uploads each to
-    Internet Archive (one IA "item" per bucket_hint, reused across every
-    subtitle for that movie instead of creating a new item per file), and
-    returns (urls, failure_reasons). Best-effort: a track that fails to
-    extract/upload is skipped (reason recorded) rather than aborting the
-    whole link — the video itself matters more than a caption attach.
+    Extracts every subtitle track normalized to 'English' and hosts each on
+    BOTH Archive.org and Litterbox (see host_subtitle_everywhere). Returns
+    (candidates, failure_reasons), where each candidate is
+    {"hosts": [(url, host_name), ...]} — one entry per subtitle track, with
+    up to two hosted copies each. A track only ends up in failure_reasons
+    if BOTH hosts failed to take the upload at all.
     """
-    urls = []
+    candidates = []
     failures = []
     english_tracks = [s for s in subtitle_tracks if s["language"] == "English"]
     if not english_tracks:
-        return urls, failures
+        return candidates, failures
 
     for idx, sub in enumerate(english_tracks):
         srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
         try:
             extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
-            url = upload_to_archive_org(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
-            urls.append(url)
-            print(f"       [SUB] English subtitle #{idx+1} hosted -> {url}")
+            hosted = host_subtitle_everywhere(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
+            candidates.append({"hosts": hosted})
+            for url, host in hosted:
+                print(f"       [SUB] English subtitle #{idx+1} hosted via {host} -> {url}")
         except Exception as e:
             failures.append(f"track #{idx+1}: {e}")
             print(f"       [WARN] Could not prepare English subtitle #{idx+1}: {e}")
         finally:
             safe_delete(srt_path)
 
-    return urls, failures
+    return candidates, failures
 
 
 def beam_login():
@@ -562,7 +651,7 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
         # Extract + host every English subtitle track ONCE per link — same
         # captions get attached to every audio-language video we upload
         # below, so there's no need to redo this per audio track.
-        subtitle_urls, prep_failures = prepare_english_subtitle_urls(
+        subtitle_candidates, prep_failures = prepare_english_subtitle_urls(
             temp_path, subtitle_tracks, f"{tmdb_id}", f"{tmdb_id}_{quality}_link{link_number}"
         )
         for fail_reason in prep_failures:
@@ -599,16 +688,19 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
             processed_languages.add(lang)
             print(f"       [OK] {lang} uploaded and registered ({video_url}).")
 
-            # Best-effort: attach every prepared English subtitle to this filecode.
-            for sub_url in subtitle_urls:
+            # Best-effort: try attaching each subtitle candidate, using
+            # whichever hosted copy (Archive.org or Litterbox) actually
+            # works. Only a candidate where BOTH copies fail becomes a warning.
+            for candidate in subtitle_candidates:
                 try:
-                    attach_subtitle_to_vidara(filecode, sub_url, sub_lang="English")
-                    print(f"       [SUB] Attached English caption to {filecode}")
+                    used_host = attach_first_working(filecode, candidate["hosts"], sub_lang="English")
+                    print(f"       [SUB] Attached English caption via {used_host} to {filecode}")
                 except Exception as e:
+                    links = " | ".join(f"{host}: {url}" for url, host in candidate["hosts"])
                     warning = (
-                        f"{quality} Link #{link_number} [{lang}] video {video_url} (filecode {filecode}): "
-                        f"video uploaded OK but subtitle attach failed ({e}). "
-                        f"Download the caption yourself here: {sub_url}"
+                        f"{quality} Link #{link_number} [{lang}] video {video_url}: "
+                        f"subtitle attach failed on every hosted copy ({e}). "
+                        f"Manual download — {links}"
                     )
                     subtitle_warnings.append(warning)
                     print(f"       [WARN] {warning}")
