@@ -517,9 +517,33 @@ def beam_upsert(jwt, tmdb_id, quality, language, url):
 
 def download_file(url, dest_path):
     cmd = [
-        "aria2c", "-x", "8", "-s", "8", "-k", "5M",
-        "--file-allocation=none", "--summary-interval=0", "--retry-wait=10",
-        "--max-tries=8", "--timeout=45", "--auto-file-renaming=false",
+        "aria2c",
+        "-x", "16",              # max connections PER SERVER (was 8) — most
+                                  # slowdowns on hosts like this are per-
+                                  # connection throttling, not your actual
+                                  # bandwidth, so more parallel connections
+                                  # is what actually speeds this up.
+        "-s", "16",               # split file into 16 pieces (was 8)
+        "-j", "16",               # max concurrent downloads (irrelevant for
+                                  # a single file, but keeps aria2c from
+                                  # capping itself below -x/-s)
+        "-k", "1M",               # smaller min split size (was 5M) so 16
+                                  # connections can actually be used on
+                                  # files that aren't huge — 5M forced too
+                                  # few pieces to ever reach 8, let alone 16
+        "--file-allocation=none",
+        "--summary-interval=0",
+        "--retry-wait=5",        # was 10 — retry faster on transient drops
+        "--max-tries=8",
+        "--timeout=45",
+        "--connect-timeout=15",
+        "--auto-file-renaming=false",
+        "--disable-ipv6=true",   # avoids slow IPv6-then-fallback-to-IPv4
+                                  # stalls some hosts/runners hit
+        "--max-connection-per-server=16",
+        "--min-split-size=1M",
+        "--user-agent=Mozilla/5.0",   # some hosts silently throttle the
+                                       # default aria2c UA string
         "-d", os.path.dirname(dest_path), "-o", os.path.basename(dest_path), url
     ]
     result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
