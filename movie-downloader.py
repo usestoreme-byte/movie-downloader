@@ -70,12 +70,35 @@ TEMP_FOLDER = "./temp_downloads"
 for p in [OUTPUT_FOLDER, TEMP_FOLDER]:
     os.makedirs(p, exist_ok=True)
 
+# Comprehensive ISO 639-1 language list (name + ISO 639-2/B code) so audio
+# tracks in less-common languages (Indonesian, Thai, Hebrew, etc.) get
+# properly identified instead of falling through to "Unknown".
 LANG_MAP = {
     "as": "Assamese", "te": "Telugu", "hi": "Hindi", "ta": "Tamil", "ml": "Malayalam",
     "kn": "Kannada", "bn": "Bengali", "pa": "Punjabi", "gu": "Gujarati", "mr": "Marathi",
     "or": "Oriya", "en": "English", "ja": "Japanese", "ko": "Korean", "es": "Spanish",
     "fr": "French", "de": "German", "ru": "Russian", "zh": "Chinese", "it": "Italian",
     "pt": "Portuguese", "ar": "Arabic", "tr": "Turkish",
+    "id": "Indonesian", "ms": "Malay", "th": "Thai", "vi": "Vietnamese", "tl": "Filipino",
+    "he": "Hebrew", "fa": "Persian", "ur": "Urdu", "ne": "Nepali", "si": "Sinhala",
+    "my": "Burmese", "km": "Khmer", "lo": "Lao", "mn": "Mongolian",
+    "nl": "Dutch", "sv": "Swedish", "no": "Norwegian", "da": "Danish", "fi": "Finnish",
+    "pl": "Polish", "cs": "Czech", "sk": "Slovak", "hu": "Hungarian", "ro": "Romanian",
+    "el": "Greek", "uk": "Ukrainian", "bg": "Bulgarian", "hr": "Croatian", "sr": "Serbian",
+    "sl": "Slovenian", "bs": "Bosnian", "mk": "Macedonian", "sq": "Albanian",
+    "lt": "Lithuanian", "lv": "Latvian", "et": "Estonian", "is": "Icelandic",
+    "ga": "Irish", "cy": "Welsh", "eu": "Basque", "ca": "Catalan", "gl": "Galician",
+    "af": "Afrikaans", "zu": "Zulu", "xh": "Xhosa", "sw": "Swahili", "am": "Amharic",
+    "so": "Somali", "ha": "Hausa", "yo": "Yoruba", "ig": "Igbo", "st": "Sotho",
+    "ka": "Georgian", "hy": "Armenian", "az": "Azerbaijani", "kk": "Kazakh",
+    "uz": "Uzbek", "ky": "Kyrgyz", "tg": "Tajik", "tk": "Turkmen", "ps": "Pashto",
+    "ku": "Kurdish", "sd": "Sindhi", "bo": "Tibetan", "dz": "Dzongkha",
+    "jv": "Javanese", "su": "Sundanese", "ceb": "Cebuano", "haw": "Hawaiian",
+    "mi": "Maori", "sm": "Samoan", "to": "Tongan", "fj": "Fijian",
+    "eo": "Esperanto", "la": "Latin", "yi": "Yiddish", "mt": "Maltese",
+    "lb": "Luxembourgish", "fo": "Faroese", "gd": "Scottish Gaelic", "br": "Breton",
+    "co": "Corsican", "oc": "Occitan", "rm": "Romansh", "gn": "Guarani",
+    "qu": "Quechua", "ay": "Aymara", "ht": "Haitian Creole",
 }
 
 UNKNOWN_TOKENS = {"", "und", "unknown", "unk", "n/a", "none"}
@@ -88,6 +111,26 @@ ISO2_TO_ISO3 = {
     "or": "ori", "en": "eng", "ja": "jpn", "ko": "kor", "es": "spa",
     "fr": "fre", "de": "ger", "ru": "rus", "zh": "chi", "it": "ita",
     "pt": "por", "ar": "ara", "tr": "tur",
+    "id": "ind", "ms": "may", "th": "tha", "vi": "vie", "tl": "fil",
+    "he": "heb", "fa": "per", "ur": "urd", "ne": "nep", "si": "sin",
+    "my": "bur", "km": "khm", "lo": "lao", "mn": "mon",
+    "nl": "dut", "sv": "swe", "no": "nor", "da": "dan", "fi": "fin",
+    "pl": "pol", "cs": "cze", "sk": "slo", "hu": "hun", "ro": "rum",
+    "el": "gre", "uk": "ukr", "bg": "bul", "hr": "hrv", "sr": "srp",
+    "sl": "slv", "bs": "bos", "mk": "mac", "sq": "alb",
+    "lt": "lit", "lv": "lav", "et": "est", "is": "ice",
+    "ga": "gle", "cy": "wel", "eu": "baq", "ca": "cat", "gl": "glg",
+    "af": "afr", "zu": "zul", "xh": "xho", "sw": "swa", "am": "amh",
+    "so": "som", "ha": "hau", "yo": "yor", "ig": "ibo", "st": "sot",
+    "ka": "geo", "hy": "arm", "az": "aze", "kk": "kaz",
+    "uz": "uzb", "ky": "kir", "tg": "tgk", "tk": "tuk", "ps": "pus",
+    "ku": "kur", "sd": "snd", "bo": "tib", "dz": "dzo",
+    "jv": "jav", "su": "sun", "ceb": "ceb", "haw": "haw",
+    "mi": "mao", "sm": "smo", "to": "ton", "fj": "fij",
+    "eo": "epo", "la": "lat", "yi": "yid", "mt": "mlt",
+    "lb": "ltz", "fo": "fao", "gd": "gla", "br": "bre",
+    "co": "cos", "oc": "oci", "rm": "roh", "gn": "grn",
+    "qu": "que", "ay": "aym", "ht": "hat",
 }
 
 NAME_TO_ISO3 = {}
@@ -296,15 +339,39 @@ def extract_subtitle_to_srt(source_path, subtitle_stream_index, output_srt_path)
     return True
 
 
+def extract_subtitle_raw_copy(source_path, subtitle_stream_index, output_path):
+    """
+    Fallback for image-based subtitle codecs (PGS/HDMV, VobSub, etc.) that
+    ffmpeg cannot convert to text-based SRT ("Subtitle encoding currently
+    only possible from text to text or bitmap to bitmap"). These still
+    stream-copy fine, so we pull the raw track out as-is (no conversion)
+    into a .sup container. It's not readable as plain text, but it's still
+    a usable backup — can be run through an external OCR tool (e.g.
+    SubtitleEdit / PgsToSrt) locally if the embedded track in the video
+    doesn't get picked up automatically by Vidara.
+    """
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(source_path),
+        "-map", f"0:s:{subtitle_stream_index}",
+        "-c:s", "copy",
+        str(output_path)
+    ]
+    result = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+    if result.returncode != 0 or not os.path.exists(output_path) or os.path.getsize(output_path) < 10:
+        raise Exception(f"ffmpeg raw subtitle copy failed: {result.stderr[-300:] if result.stderr else 'unknown error'}")
+    return True
+
+
 def slugify_for_ia(text, max_len=80):
     text = re.sub(r'[^a-zA-Z0-9\-_.]', '-', text or "")
     text = re.sub(r'-+', '-', text).strip('-_.')
     return (text.lower() or "item")[:max_len]
 
 
-def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="application/x-subrip", wait_seconds=60):
+def upload_to_archive_org(file_path, bucket_hint, key_hint, content_type="application/x-subrip", extension="srt", wait_seconds=60):
     bucket = slugify_for_ia(f"beamplay-subs-{bucket_hint}")
-    key = slugify_for_ia(key_hint) + ".srt"
+    key = slugify_for_ia(key_hint) + f".{extension}"
     upload_url = f"https://s3.us.archive.org/{bucket}/{key}"
 
     headers = {
@@ -357,18 +424,18 @@ def upload_to_litterbox(file_path, expire="72h"):
     return url
 
 
-def host_subtitle_everywhere(srt_path, bucket_hint, key_hint):
+def host_subtitle_everywhere(sub_path, bucket_hint, key_hint, content_type="application/x-subrip", extension="srt"):
     hosted = []
     errors = []
 
     try:
-        url = upload_to_archive_org(srt_path, bucket_hint, key_hint)
+        url = upload_to_archive_org(sub_path, bucket_hint, key_hint, content_type=content_type, extension=extension)
         hosted.append((url, "Archive.org"))
     except Exception as e:
         errors.append(f"Archive.org: {e}")
 
     try:
-        url = upload_to_litterbox(srt_path)
+        url = upload_to_litterbox(sub_path)
         hosted.append((url, "Litterbox"))
     except Exception as e:
         errors.append(f"Litterbox: {e}")
@@ -395,17 +462,34 @@ def prepare_english_subtitle_urls(source_path, subtitle_tracks, bucket_hint, tmp
 
     for idx, sub in enumerate(english_tracks):
         srt_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.srt")
+        sup_path = os.path.join(TEMP_FOLDER, f"{tmp_prefix}_sub{idx}.sup")
         try:
             extract_subtitle_to_srt(source_path, sub["stream_index"], srt_path)
             hosted = host_subtitle_everywhere(srt_path, bucket_hint, f"{tmp_prefix}_sub{idx}")
-            candidates.append({"hosts": hosted})
+            candidates.append({"hosts": hosted, "format": "srt"})
             for url, host in hosted:
-                print(f"       [SUB] English subtitle #{idx+1} hosted via {host} -> {url}")
-        except Exception as e:
-            failures.append(f"track #{idx+1}: {e}")
-            print(f"       [WARN] Could not prepare English subtitle #{idx+1}: {e}")
+                print(f"       [SUB] English subtitle #{idx+1} (srt) hosted via {host} -> {url}")
+        except Exception as srt_err:
+            # Text conversion failed — most likely an image-based codec
+            # (PGS/HDMV, VobSub, etc). Fall back to a raw stream-copy
+            # instead of giving up: not human-readable directly, but still
+            # a usable backup (e.g. via SubtitleEdit/PgsToSrt locally), and
+            # it's the same track that's already embedded in the video.
+            try:
+                extract_subtitle_raw_copy(source_path, sub["stream_index"], sup_path)
+                hosted = host_subtitle_everywhere(
+                    sup_path, bucket_hint, f"{tmp_prefix}_sub{idx}",
+                    content_type="application/octet-stream", extension="sup"
+                )
+                candidates.append({"hosts": hosted, "format": "sup (image-based, needs OCR)"})
+                for url, host in hosted:
+                    print(f"       [SUB] English subtitle #{idx+1} (raw .sup, image-based) hosted via {host} -> {url}")
+            except Exception as raw_err:
+                failures.append(f"track #{idx+1}: {raw_err}")
+                print(f"       [WARN] Could not prepare English subtitle #{idx+1} as srt ({srt_err}) or raw copy ({raw_err})")
         finally:
             safe_delete(srt_path)
+            safe_delete(sup_path)
 
     return candidates, failures
 
@@ -535,8 +619,9 @@ def process_quality(jwt, tmdb_id, tmdb_name, year, quality, links_raw, row_idx):
         if subtitle_candidates:
             for cand_idx, candidate in enumerate(subtitle_candidates, start=1):
                 links_str = " | ".join(f"{host}: {url}" for url, host in candidate["hosts"])
+                fmt = candidate.get("format", "srt")
                 subtitle_notes.append(
-                    f"{quality} Link #{link_number}: English subtitle #{cand_idx} backup — {links_str}"
+                    f"{quality} Link #{link_number}: English subtitle #{cand_idx} backup [{fmt}] — {links_str}"
                 )
         for fail_reason in prep_failures:
             subtitle_notes.append(
